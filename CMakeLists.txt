@@ -110,6 +110,7 @@ set(MPC_SOURCES
     src/gait/gait_generator.cpp
     src/kinematics/quadruped_kin.cpp
     src/mpc/mpc_controller.cpp
+    src/mpc/nmpc_footstep.cpp
     src/wbc/wbc_controller.cpp
     src/main.cpp
 )
