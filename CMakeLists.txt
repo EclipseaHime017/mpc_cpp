@@ -60,12 +60,28 @@ endif()
 #          cmake -S casadi -B casadi/build -DWITH_IPOPT=ON
 #          cmake --build casadi/build -j4 && cmake --install casadi/build
 # Requires: sudo apt install coinor-libipopt-dev
-find_package(casadi REQUIRED
+find_package(casadi QUIET
     HINTS /usr/local/lib/cmake/casadi
           /usr/local/share/casadi
           $ENV{CONDA_PREFIX}/lib/cmake/casadi
           ${CMAKE_PREFIX_PATH})
-message(STATUS "CasADi found")
+if(casadi_FOUND AND TARGET casadi::casadi)
+    set(CASADI_LINK_LIB casadi::casadi)
+    message(STATUS "CasADi found (imported target)")
+elseif(casadi_FOUND OR CASADI_LIBRARIES)
+    # CasADi found but no namespaced target — use variables directly
+    if(NOT CASADI_LIBRARIES)
+        find_library(CASADI_LIB casadi
+            HINTS /usr/local/lib /usr/lib
+                  $ENV{CONDA_PREFIX}/lib)
+        set(CASADI_LIBRARIES ${CASADI_LIB})
+        set(CASADI_INCLUDE_DIRS /usr/local/include)
+    endif()
+    set(CASADI_LINK_LIB ${CASADI_LIBRARIES})
+    message(STATUS "CasADi found (libraries: ${CASADI_LIBRARIES})")
+else()
+    message(FATAL_ERROR "CasADi not found. Install with: cmake -DWITH_IPOPT=ON ...")
+endif()
 
 # --- libusb (for CAN interfaces, inherited from pure_cpp) ---
 pkg_check_modules(LIBUSB REQUIRED libusb-1.0)
@@ -112,6 +128,7 @@ target_include_directories(mpc_robot_control PUBLIC
     ${PURE_CPP_DIR}/include
     ${LIBUSB_INCLUDE_DIRS}
     ${EIGEN3_INCLUDE_DIR}
+    ${CASADI_INCLUDE_DIRS}
 )
 
 target_link_libraries(mpc_robot_control
@@ -120,7 +137,7 @@ target_link_libraries(mpc_robot_control
     yaml-cpp
     osqp::osqp
     ${OSQP_CPP_LIB}
-    casadi::casadi
+    ${CASADI_LINK_LIB}
     ${LIBUSB_LIBRARIES}
 )
 
@@ -140,12 +157,13 @@ add_executable(test_mpc_solver
 target_include_directories(test_mpc_solver PUBLIC
     include
     ${EIGEN3_INCLUDE_DIR}
+    ${CASADI_INCLUDE_DIRS}
 )
 target_link_libraries(test_mpc_solver
     Eigen3::Eigen
     yaml-cpp
     osqp::osqp         # mpc_controller.cpp uses OSQP C API directly
-    casadi::casadi
+    ${CASADI_LINK_LIB}
 )
 
 # ============================================================
