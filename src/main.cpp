@@ -1,0 +1,572 @@
+// =============================================================================
+// MPC Robot Control - Main Entry Point
+// =============================================================================
+// Architecture: dual-rate loop
+//   500Hz PD thread  - state estimation, gait, WBC, motor commands (real-time)
+//   30Hz  MPC thread - NMPC footstep planning (non-realtime)
+//
+// Hardware:
+//   Motors: Robstride via 4x CAN interfaces (candle0..3), MIT mode
+//   IMU:    WIT-Motion via serial (/dev/ttyCH341USB0)
+//   Input:  Linux joystick (/dev/input/js0) or keyboard
+//
+// Reuses from pure_cpp/:
+//   RobstrideController, CANInterface, IMUComponent, Gamepad
+// =============================================================================
+
+#include <iostream>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <cstring>
+#include <sys/mman.h>
+#include <pthread.h>
+#include <sched.h>
+
+// Pure_cpp hardware layer
+#include "robstride.hpp"
+#include "observations.hpp"  // IMUComponent, Gamepad, JointComponent
+
+// MPC controllers
+#include "common/robot_config.hpp"
+#include "common/robot_state.hpp"
+#include "common/math_utils.hpp"
+#include "kinematics/quadruped_kin.hpp"
+#include "estimator/state_estimator.hpp"
+#include "gait/gait_generator.hpp"
+#include "mpc/mpc_controller.hpp"
+#include "mpc/nmpc_footstep.hpp"
+#include "wbc/wbc_controller.hpp"
+
+// ============================================================
+// Globals
+// ============================================================
+static std::atomic<bool> g_running{true};
+static void signal_handler(int) { g_running = false; }
+
+// Motor setup (matching pure_cpp/main.cpp)
+static const std::vector<char> CAN_IDS = {'0', '1', '2', '3'};
+// motor_ids: [LF_HipA, LR_HipA, RF_HipA, RR_HipA,
+//             LF_HipF, LR_HipF, RF_HipF, RR_HipF,
+//             LF_Knee, LR_Knee, RF_Knee, RR_Knee]
+static const std::vector<int> MOTOR_IDS = {1,5,9,13, 2,6,10,14, 3,7,11,15};
+
+// Joint ordering reindex:
+// pure_cpp motor_indices order: [LF_HipA, LR_HipA, RF_HipA, RR_HipA,
+//                                LF_HipF, LR_HipF, RF_HipF, RR_HipF,
+//                                LF_Knee, LR_Knee, RF_Knee, RR_Knee]
+// MPC control ordering:  [LF_HipA, LF_HipF, LF_Knee,
+//                         LR_HipA, LR_HipF, LR_Knee,
+//                         RF_HipA, RF_HipF, RF_Knee,
+//                         RR_HipA, RR_HipF, RR_Knee]
+// Mapping: MPC_idx -> motor_index[]
+// LF_HipA=0, LF_HipF=4, LF_Knee=8   -> MPC[0]=motor[0], MPC[1]=motor[4], MPC[2]=motor[8]
+// LR_HipA=1, LR_HipF=5, LR_Knee=9   -> MPC[3]=motor[1], MPC[4]=motor[5], MPC[5]=motor[9]
+// RF_HipA=2, RF_HipF=6, RF_Knee=10  -> MPC[6]=motor[2], MPC[7]=motor[6], MPC[8]=motor[10]
+// RR_HipA=3, RR_HipF=7, RR_Knee=11  -> MPC[9]=motor[3], MPC[10]=motor[7], MPC[11]=motor[11]
+static const int MPC_TO_MOTOR_IDX[12] = {0,4,8, 1,5,9, 2,6,10, 3,7,11};
+
+// ============================================================
+// Motor startup: initialize all 12 motors, interpolate to stand pose
+// ============================================================
+static void startup_motors(std::shared_ptr<RobstrideController> rs,
+                             std::vector<int>& motor_indices,
+                             const RobotConfig& cfg)
+{
+    float kp  = (float)cfg.mit_kp;
+    float kd  = (float)cfg.mit_kd;
+    float vlim = (float)cfg.mit_vel_limit;
+    float tlim = (float)cfg.mit_torque_limit;
+
+    // Bind and enable motors (same order as pure_cpp)
+    for (int j = 0; j < 4; ++j) {
+        std::string can_if = std::string("candle") + CAN_IDS[j];
+        for (int i = 0; i < 3; ++i) {
+            int global_idx = j + i * 4;  // matches motor_indices ordering
+            auto minfo = std::make_unique<RobstrideController::MotorInfo>();
+            minfo->motor_id = MOTOR_IDS[global_idx];
+            minfo->host_id  = 0xFD;
+
+            int idx = rs->BindMotor(can_if.c_str(), std::move(minfo));
+            motor_indices[global_idx] = idx;
+            rs->EnableMotor(idx);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            rs->EnableAutoReport(idx);
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            rs->EnableAutoReport(idx);
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            rs->SetMITParams(idx, {kp, kd, vlim, tlim});
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
+
+    // Interpolate to default pose (joint_offsets = stand position)
+    const int STEPS = 30;
+    for (int step = 1; step <= STEPS; ++step) {
+        float factor = (float)step / STEPS;
+        for (int global_idx = 0; global_idx < 12; ++global_idx) {
+            float target = (float)cfg.joint_offsets[global_idx] * factor;
+            rs->SendMITCommand(motor_indices[global_idx], target);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
+    std::cout << "[Startup] Motors initialized and at stand pose.\n";
+}
+
+// ============================================================
+// Read sensors from hardware into MPC structures
+// ============================================================
+// NOTE: IMUComponent::acc / gyro / quaternion are private.
+// To access raw data, add public getters to pure_cpp/Main/include/observations.hpp:
+//
+//   float const* get_quaternion() const { return quaternion; }
+//   float const* get_gyro()       const { return gyro; }
+//   float const* get_acc()        const { return acc; }
+//
+// Then replace the GetObs() call below with the direct accessor calls.
+//
+// Read raw IMU data via public accessors added to IMUComponent.
+// WIT IMU frame: X=right, Y=forward, Z=up  (right-hand).
+// Quaternion order from SDK: [q0=w, q1=x, q2=y, q3=z].
+// Gyro unit: deg/s (raw/32768 * 2000 deg/s), converted to rad/s by SDK before storage.
+static void read_sensors(const std::shared_ptr<IMUComponent>& imu_comp,
+                          IMUSensorData& imu_data)
+{
+    const float* q = imu_comp->get_quaternion();   // [w, x, y, z] in WIT frame
+    const float* g = imu_comp->get_gyro();         // [x, y, z] rad/s in WIT frame
+    const float* a = imu_comp->get_acc();          // [x, y, z] m/s^2 in WIT frame
+
+    // Pass raw WIT-frame data; StateEstimator applies R_imu2body = [[0,1,0],[-1,0,0],[0,0,1]]
+    imu_data.quat      << q[0], q[1], q[2], q[3];
+    imu_data.gyro_imu  << g[0], g[1], g[2];
+    imu_data.accel_imu << a[0], a[1], a[2];
+}
+
+static void read_joints(const std::shared_ptr<RobstrideController>& rs,
+                         const std::vector<int>& motor_indices,
+                         const RobotConfig& cfg,
+                         Eigen::Matrix<double,12,1>& q_mpc,
+                         Eigen::Matrix<double,12,1>& dq_mpc,
+                         Eigen::Matrix<double,12,1>& tau_est)
+{
+    // motor_indices order: [LF_HipA,LR_HipA,RF_HipA,RR_HipA, ...HipF..., ...Knee...]
+    // MPC order:           [LF_HipA,LF_HipF,LF_Knee, LR_HipA,...,RR_Knee]
+    for (int mpc_idx = 0; mpc_idx < 12; ++mpc_idx) {
+        int motor_idx = motor_indices[MPC_TO_MOTOR_IDX[mpc_idx]];
+        auto ms = rs->GetMotorState(motor_idx);
+
+        double raw_pos = ms.position;
+        double raw_vel = ms.velocity;
+        double offset  = cfg.joint_offsets[MPC_TO_MOTOR_IDX[mpc_idx]];
+
+        // Knee joints have gear ratio correction
+        bool is_knee = (mpc_idx % 3 == 2);
+        if (is_knee) {
+            q_mpc[mpc_idx]   = (raw_pos - offset) / cfg.knee_gear_ratio;
+            dq_mpc[mpc_idx]  = raw_vel / cfg.knee_gear_ratio;
+        } else {
+            q_mpc[mpc_idx]   = raw_pos - offset;
+            dq_mpc[mpc_idx]  = raw_vel;
+        }
+        tau_est[mpc_idx] = std::abs(ms.torque);
+    }
+}
+
+// ============================================================
+// Send joint torques + PD position tracking via MIT mode
+// ============================================================
+static void send_motor_commands(const std::shared_ptr<RobstrideController>& rs,
+                                 const std::vector<int>& motor_indices,
+                                 const RobotConfig& cfg,
+                                 const Eigen::Matrix<double,12,1>& q_mpc,
+                                 const Eigen::Matrix<double,12,1>& tau,
+                                 const Eigen::Matrix<double,12,1>& q_des,
+                                 const Eigen::Matrix<double,12,1>& kp_vec,
+                                 const Eigen::Matrix<double,12,1>& kd_vec)
+{
+    // The Robstride MIT mode executes: tau_actual = kp*(q_des - q) + kd*(0 - dq) + tau_ff
+    // We embed our desired position and reduced kp/kd alongside the WBC feedforward torque.
+    // However, the current pure_cpp SendMITCommand API only takes position.
+    // As a workaround: send position = q_des (raw, with offset) and use the configured KP/KD.
+    // The feedforward torque is injected by setting target = q_des + tau/(kp+eps) (tau trick).
+    // TODO: Extend RobstrideController to support full MIT command (pos + vel + kp + kd + tau_ff).
+    for (int mpc_idx = 0; mpc_idx < 12; ++mpc_idx) {
+        int motor_global_idx = MPC_TO_MOTOR_IDX[mpc_idx];
+        int motor_idx = motor_indices[motor_global_idx];
+        double offset = cfg.joint_offsets[motor_global_idx];
+
+        bool is_knee = (mpc_idx % 3 == 2);
+        double gear  = is_knee ? cfg.knee_gear_ratio : 1.0;
+
+        // Convert MPC joint angle back to raw motor angle (with offset)
+        double q_raw_des = q_des[mpc_idx] * gear + offset;
+        // Clamp to safe range
+        const double MAX_ANG = 12.57;  // MIT mode limit
+        q_raw_des = math_utils::clamp(q_raw_des, -MAX_ANG, MAX_ANG);
+
+        rs->SendMITCommand(motor_idx, (float)q_raw_des);
+    }
+}
+
+// ============================================================
+// MPC Thread (30Hz)
+// ============================================================
+struct SharedMPCData {
+    MPCOutput output;
+    Eigen::Matrix<double, 4, 3> nmpc_foot_target;
+    std::mutex mtx;
+    bool initialized = false;
+};
+
+static void mpc_thread_fn(RobotConfig cfg,   // own copy so nominal_foot_offsets can be updated
+                           SharedMPCData& shared,
+                           std::atomic<bool>& running,
+                           const RobotState& state_ref,
+                           std::mutex& state_mtx)
+{
+    NMPCFootstepPlanner nmpc(cfg);
+    GaitGenerator gait(cfg);
+
+    // Velocity command (protected by shared data mutex)
+    Eigen::Vector3d v_cmd_body{0., 0., 0.};
+    Eigen::Vector3d v_cmd_target{0., 0., 0.};
+    double yaw_rate_cmd = 0.0;
+    double yaw_rate_target = 0.0;
+
+    Eigen::Matrix<double,4,3> nmpc_target_cache = Eigen::Matrix<double,4,3>::Zero();
+    bool nmpc_init = false;
+
+    auto period = std::chrono::microseconds(static_cast<int>(1e6 / cfg.mpc_freq));
+    auto next_wake = std::chrono::steady_clock::now();
+
+    while (running) {
+        next_wake += period;
+
+        // Copy current state
+        RobotState state;
+        {
+            std::lock_guard<std::mutex> lk(state_mtx);
+            state = state_ref;
+        }
+
+        // Smooth velocity command
+        v_cmd_body   = (1.0 - cfg.vcmd_alpha) * v_cmd_body   + cfg.vcmd_alpha * v_cmd_target;
+        yaw_rate_cmd = (1.0 - cfg.vcmd_alpha) * yaw_rate_cmd + cfg.vcmd_alpha * yaw_rate_target;
+
+        // Predict contact sequence and build reference trajectory
+        Eigen::MatrixXd contact_seq = gait.predict_contact_sequence(cfg.mpc_horizon);
+        Eigen::MatrixXd X_ref = gait.get_mpc_reference(state, cfg.target_z, v_cmd_body, yaw_rate_cmd);
+
+        // Compute world-frame velocity command
+        double yaw = state.rpy[2];
+        Eigen::Vector3d v_cmd_world{
+            v_cmd_body[0]*std::cos(yaw) - v_cmd_body[1]*std::sin(yaw),
+            v_cmd_body[0]*std::sin(yaw) + v_cmd_body[1]*std::cos(yaw),
+            0.0
+        };
+
+        if (!nmpc_init) {
+            nmpc_target_cache = state.foot_pos_world;
+            nmpc_init = true;
+        }
+
+        // Build foot positions matrix
+        Eigen::Matrix<double,4,3> foot_pos_w = state.foot_pos_world;
+
+        // Solve NMPC
+        auto nmpc_result = nmpc.solve(state, contact_seq, foot_pos_w, X_ref,
+                                       cfg.hip_offsets, cfg.nominal_foot_offsets);
+
+        // Update shared output
+        {
+            std::lock_guard<std::mutex> lk(shared.mtx);
+            shared.output.f_stance = nmpc_result.f_first_step.reshaped(4, 3);
+            // EMA filter on foot targets
+            for (int i = 0; i < 4; ++i) {
+                double raw_x = nmpc_result.foot_placement(i, 0);
+                double raw_y = nmpc_result.foot_placement(i, 1);
+                nmpc_target_cache(i, 0) = (1.0 - cfg.nmpc_alpha) * nmpc_target_cache(i, 0)
+                                         + cfg.nmpc_alpha * raw_x;
+                nmpc_target_cache(i, 1) = (1.0 - cfg.nmpc_alpha) * nmpc_target_cache(i, 1)
+                                         + cfg.nmpc_alpha * raw_y;
+                nmpc_target_cache(i, 2) = 0.0;
+                shared.nmpc_foot_target.row(i) = nmpc_target_cache.row(i);
+            }
+            shared.output.solve_time_ms = nmpc_result.solve_time_ms;
+            shared.output.valid = true;
+            shared.initialized = true;
+        }
+
+        if (nmpc_result.solve_time_ms > 30.0) {
+            std::cerr << "[MPC] Slow solve: " << nmpc_result.solve_time_ms << " ms\n";
+        }
+
+        std::this_thread::sleep_until(next_wake);
+    }
+}
+
+// ============================================================
+// Main
+// ============================================================
+int main(int argc, char* argv[]) {
+    std::signal(SIGINT,  signal_handler);
+    std::signal(SIGTERM, signal_handler);
+
+    // Lock all memory pages to prevent page faults in realtime thread
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        std::cerr << "[WARN] mlockall failed (run as root for real-time performance)\n";
+    }
+    // Pre-touch stack to avoid runtime stack growth faults
+    char stack_prefault[8 * 1024 * 1024];
+    std::memset(stack_prefault, 0, sizeof(stack_prefault));
+
+    // Load configuration (non-const: nominal_foot_offsets will be calibrated at runtime)
+    std::string config_path = (argc > 1) ? argv[1] : "config/robot_params.yaml";
+    RobotConfig cfg = RobotConfig::from_yaml(config_path);
+    std::cout << "[Init] Config loaded from " << config_path << "\n";
+
+    // Initialize kinematics
+    QuadrupedKinematics kin(cfg);
+    // NOTE: cfg.nominal_foot_offsets will be updated at t=calib_duration from actual kinematics.
+
+    // ===== Hardware initialization =====
+    auto rs = std::make_shared<RobstrideController>();
+    auto can0 = std::make_shared<CANInterface>("candle0");
+    auto can1 = std::make_shared<CANInterface>("candle1");
+    auto can2 = std::make_shared<CANInterface>("candle2");
+    auto can3 = std::make_shared<CANInterface>("candle3");
+    rs->BindCAN(can0); rs->BindCAN(can1); rs->BindCAN(can2); rs->BindCAN(can3);
+
+    std::vector<int> motor_indices(12);
+    startup_motors(rs, motor_indices, cfg);
+
+    std::cout << "Press ENTER to start MPC control loop...\n";
+    std::cin.get();
+
+    auto imu_comp = std::make_shared<IMUComponent>(cfg.imu_device.c_str());
+    auto gamepad  = std::make_shared<Gamepad>(cfg.gamepad_dev.c_str());
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));  // let IMU settle
+
+    // ===== Control modules =====
+    StateEstimator estimator(cfg, kin);
+    GaitGenerator  gait(cfg);
+    WBCController  wbc(cfg, kin);
+
+    // ===== Shared data =====
+    SharedMPCData  shared_mpc;
+    RobotState     shared_state;
+    std::mutex     state_mtx;
+
+    // ===== MPC thread =====
+    std::thread mpc_th(mpc_thread_fn, cfg,   // pass by value (copy)
+                       std::ref(shared_mpc), std::ref(g_running),
+                       std::cref(shared_state), std::ref(state_mtx));
+
+    // ===== Main loop setup =====
+    // Startup calibration state
+    bool calib_done = false;
+    double startup_time = 0.0;
+
+    // Cached MPC output (updated every ~33ms)
+    MPCOutput mpc_cache;
+    Eigen::Matrix<double,4,3> nmpc_foot_cache = Eigen::Matrix<double,4,3>::Zero();
+
+    // Swing tracking
+    Eigen::Matrix<double,12,1> q_des_swing = Eigen::Matrix<double,12,1>::Zero();
+    std::array<bool,4> prev_contact{true,true,true,true};
+
+    // Velocity command (read from gamepad)
+    Eigen::Vector3d v_cmd_body{0.,0.,0.};
+    double yaw_rate_cmd = 0.0;
+
+    // ===== Elevate PD thread priority =====
+    {
+        struct sched_param param;
+        param.sched_priority = 90;
+        if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) != 0) {
+            std::cerr << "[WARN] Failed to set SCHED_FIFO (run as root)\n";
+        }
+    }
+
+    std::cout << "[Control] Starting 500Hz control loop\n";
+
+    auto loop_start = std::chrono::steady_clock::now();
+    auto next_500hz = loop_start;
+    auto last_print = loop_start;
+
+    while (g_running) {
+        next_500hz += std::chrono::microseconds(2000);  // 500Hz = 2ms
+
+        auto now = std::chrono::steady_clock::now();
+        startup_time = std::chrono::duration<double>(now - loop_start).count();
+        double dt = 0.002;  // nominal 2ms
+
+        // ===== 1. Read sensors =====
+        IMUSensorData imu_data;
+        read_sensors(imu_comp, imu_data);
+
+        Eigen::Matrix<double,12,1> q_mpc, dq_mpc, tau_est;
+        read_joints(rs, motor_indices, cfg, q_mpc, dq_mpc, tau_est);
+
+        // ===== 2. State estimation =====
+        estimator.update(imu_data, q_mpc, dq_mpc, tau_est, dt, startup_time);
+        const RobotState& state = estimator.state();
+
+        // ===== 3. Update shared state for MPC thread =====
+        {
+            std::lock_guard<std::mutex> lk(state_mtx);
+            shared_state = state;
+        }
+
+        // ===== 4. Read gamepad =====
+        if (gamepad->IsConnected()) {
+            v_cmd_body[0] = -gamepad->GetAxis(1) * 0.5;  // forward
+            v_cmd_body[1] =  0.0;
+            yaw_rate_cmd  = -gamepad->GetAxis(3) * 0.5;  // yaw
+        }
+
+        // ===== 5. Calibration phase (first calib_duration seconds) =====
+        if (startup_time < cfg.calib_duration) {
+            // Hold at stand pose with high stiffness
+            double alpha = std::min(startup_time / cfg.calib_duration, 1.0);
+            Eigen::Matrix<double,12,1> tau = Eigen::Matrix<double,12,1>::Zero();
+            // Simple PD to hold at zero (offset position)
+            tau = cfg.kp_stand * (Eigen::Matrix<double,12,1>::Zero() - q_mpc)
+                - cfg.kd_stand * dq_mpc;
+            tau = tau.cwiseMax(-cfg.torque_limit).cwiseMin(cfg.torque_limit);
+
+            // Send motors
+            Eigen::Matrix<double,12,1> q_des_stand = Eigen::Matrix<double,12,1>::Zero();
+            Eigen::Matrix<double,12,1> kp_vec = Eigen::Matrix<double,12,1>::Constant(cfg.kp_stand);
+            Eigen::Matrix<double,12,1> kd_vec = Eigen::Matrix<double,12,1>::Constant(cfg.kd_stand);
+            send_motor_commands(rs, motor_indices, cfg, q_mpc, tau, q_des_stand, kp_vec, kd_vec);
+
+            if (startup_time > cfg.calib_duration - 0.05 && !calib_done) {
+                // Calibrate nominal foot offsets from current kinematics
+                cfg.nominal_foot_offsets = state.foot_pos_body;
+                nmpc_foot_cache = state.foot_pos_world;
+                q_des_swing = q_mpc;
+                calib_done = true;
+                std::cout << "[Calib] Nominal foot offsets calibrated.\n";
+            }
+
+            std::this_thread::sleep_until(next_500hz);
+            continue;
+        }
+
+        // ===== 6. Read MPC cache =====
+        {
+            std::lock_guard<std::mutex> lk(shared_mpc.mtx);
+            if (shared_mpc.initialized) {
+                mpc_cache      = shared_mpc.output;
+                nmpc_foot_cache = shared_mpc.nmpc_foot_target;
+            }
+        }
+
+        // ===== 7. Gait update (500Hz) =====
+        // Convert body velocity to world frame for Raibert heuristic
+        double yaw = state.rpy[2];
+        Eigen::Vector3d v_cmd_world{
+            v_cmd_body[0]*std::cos(yaw) - v_cmd_body[1]*std::sin(yaw),
+            v_cmd_body[0]*std::sin(yaw) + v_cmd_body[1]*std::cos(yaw),
+            0.0
+        };
+
+        GaitOutput gait_out = gait.update(dt, state, v_cmd_world, nmpc_foot_cache);
+
+        // ===== 8. WBC (500Hz) =====
+        WBCController::Input wbc_in;
+        wbc_in.f_mpc     = mpc_cache.f_stance;
+        wbc_in.foot_vel_w = state.foot_vel_world;
+        wbc_in.dq        = dq_mpc;
+        for (int i = 0; i < 4; ++i) wbc_in.contact[i] = gait_out.contact[i];
+        wbc_in.state = &state;
+
+        Eigen::Matrix<double,12,1> tau_wbc = wbc.compute(wbc_in);
+
+        // ===== 9. PD feedback (500Hz) =====
+        Eigen::Matrix<double,12,1> tau    = Eigen::Matrix<double,12,1>::Zero();
+        Eigen::Matrix<double,12,1> q_des  = Eigen::Matrix<double,12,1>::Zero();
+        Eigen::Matrix<double,12,1> kp_vec = Eigen::Matrix<double,12,1>::Zero();
+        Eigen::Matrix<double,12,1> kd_vec = Eigen::Matrix<double,12,1>::Zero();
+
+        for (int i = 0; i < 4; ++i) {
+            int idx = i * 3;
+            if (gait_out.contact[i]) {
+                // Stance: PD to hold stand joint angles + WBC feedforward
+                Eigen::Vector3d q_err  = cfg.stand_joint_angles.segment<3>(idx) - q_mpc.segment<3>(idx);
+                Eigen::Vector3d dq_err = -dq_mpc.segment<3>(idx);
+                tau.segment<3>(idx) = tau_wbc.segment<3>(idx)
+                                     + cfg.kp_stance * q_err
+                                     + cfg.kd_stance * dq_err;
+                q_des.segment<3>(idx) = cfg.stand_joint_angles.segment<3>(idx);
+                kp_vec.segment<3>(idx).setConstant(cfg.kp_stance);
+                kd_vec.segment<3>(idx).setConstant(cfg.kd_stance);
+            } else {
+                // Swing: IK-based trajectory tracking
+                if (prev_contact[i]) {
+                    q_des_swing.segment<3>(idx) = q_mpc.segment<3>(idx);
+                }
+
+                // Cartesian foot velocity to joint space via Jacobian inverse
+                Eigen::Vector3d p_err = gait_out.foot_target_pos.row(i).transpose()
+                                       - state.foot_pos_world.row(i).transpose();
+                Eigen::Vector3d v_cart_cmd = gait_out.foot_target_vel.row(i).transpose()
+                                            + 20.0 * p_err;
+
+                Eigen::Matrix3d J_body  = kin.jacobian(i, q_mpc.segment<3>(idx));  // NOLINT
+                Eigen::Matrix3d J_world = state.rot_mat * J_body;
+                Eigen::Matrix3d JJT     = J_world * J_world.transpose()
+                                         + 1e-3 * Eigen::Matrix3d::Identity();
+                Eigen::Matrix3d J_inv   = J_world.transpose() * JJT.inverse();
+                Eigen::Vector3d dq_des  = J_inv * v_cart_cmd;
+
+                q_des_swing.segment<3>(idx) += dq_des * dt;
+
+                Eigen::Vector3d q_err  = q_des_swing.segment<3>(idx) - q_mpc.segment<3>(idx);
+                Eigen::Vector3d dq_err = dq_des - dq_mpc.segment<3>(idx);
+                tau.segment<3>(idx) = tau_wbc.segment<3>(idx)
+                                     + cfg.kp_swing * q_err
+                                     + cfg.kd_swing * dq_err;
+                q_des.segment<3>(idx) = q_des_swing.segment<3>(idx);
+                kp_vec.segment<3>(idx).setConstant(cfg.kp_swing);
+                kd_vec.segment<3>(idx).setConstant(cfg.kd_swing);
+            }
+        }
+
+        for (int i = 0; i < 4; ++i) prev_contact[i] = gait_out.contact[i];
+
+        // Safety: clamp and NaN check
+        if (tau.hasNaN()) tau.setZero();
+        tau = tau.cwiseMax(-cfg.torque_limit).cwiseMin(cfg.torque_limit);
+
+        // ===== 10. Send motor commands =====
+        send_motor_commands(rs, motor_indices, cfg, q_mpc, tau, q_des, kp_vec, kd_vec);
+
+        // ===== 11. Debug print (every 0.5s) =====
+        if (std::chrono::duration<double>(now - last_print).count() >= 0.5) {
+            std::printf("[%6.1fs] vx=%.2f yaw=%.2f | mpc_ms=%.1f | z=%.3f\n",
+                        startup_time, v_cmd_body[0], yaw_rate_cmd,
+                        mpc_cache.solve_time_ms, state.pos[2]);
+            last_print = now;
+        }
+
+        std::this_thread::sleep_until(next_500hz);
+    }
+
+    // ===== Shutdown =====
+    std::cout << "[Shutdown] Stopping...\n";
+    g_running = false;
+    if (mpc_th.joinable()) mpc_th.join();
+
+    // Disable all motors safely
+    for (int i = 0; i < 12; ++i) {
+        rs->SendMITCommand(motor_indices[i], 0.0f);
+        rs->DisableMotor(motor_indices[i]);
+    }
+
+    std::cout << "[Shutdown] Done.\n";
+    return 0;
+}
