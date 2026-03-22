@@ -82,7 +82,6 @@ set(HW_SOURCES
     ${PURE_CPP_DIR}/src/imu/serial.c
     ${PURE_CPP_DIR}/src/imu/wit_c_sdk.c
     ${PURE_CPP_DIR}/src/observations.cpp       # For IMUComponent, Gamepad
-    ${PURE_CPP_DIR}/src/keyboard_input.cpp
 )
 
 # ============================================================
