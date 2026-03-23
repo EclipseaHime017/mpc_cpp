@@ -151,8 +151,9 @@ cmake --build build -j$(nproc)
 ```
 
 编译成功后产物：
-- `build/mpc_robot_control` — 完整控制器（需要硬件）
-- `build/test_mpc_solver`   — 离线单元测试（不需要硬件）
+- `build/mpc_robot_control`   — 完整控制器（需要硬件）
+- `build/test_mpc_solver`     — 离线单元测试（不需要硬件）
+- `build/test_single_joint`   — 单关节硬件测试工具（需要硬件 + sudo）
 
 ### 2.4 离线测试（不需要硬件）
 
@@ -206,16 +207,48 @@ print([hex(b) for b in data])
 
 ### Step 3：单关节运动测试
 
-> ⚠️ **最关键的安全步骤**。机器人必须固定在支架上，腿悬空，先降低参数。
+> ⚠️ **最关键的安全步骤**。机器人必须固定在支架上，腿悬空。
+> 使用专用工具 `test_single_joint`，内置低刚度参数（kp=10, kd=2, torque_limit=5Nm），无需手动改配置。
 
-```yaml
-# config/robot_params.yaml 临时修改
-torque_limit: 5.0
-mit_kp: 10.0
-mit_kd: 2.0
+**用法**：
+
+```bash
+# [Jetson]
+sudo ./build/test_single_joint <mpc_index>       # 测试单个关节
+sudo ./build/test_single_joint all                # 读取全部 12 个电机位置
 ```
 
-逐一验证关节方向，填写下表：
+**mpc_index 对照表**：
+
+| mpc_index | 关节 | CAN 总线 | Motor ID |
+|-----------|------|---------|----------|
+| 0 | LF_HipA | candle0 | 1 |
+| 1 | LF_HipF | candle0 | 2 |
+| 2 | LF_Knee | candle0 | 3 |
+| 3 | LR_HipA | candle1 | 5 |
+| 4 | LR_HipF | candle1 | 6 |
+| 5 | LR_Knee | candle1 | 7 |
+| 6 | RF_HipA | candle2 | 9 |
+| 7 | RF_HipF | candle2 | 10 |
+| 8 | RF_Knee | candle2 | 11 |
+| 9 | RR_HipA | candle3 | 13 |
+| 10 | RR_HipF | candle3 | 14 |
+| 11 | RR_Knee | candle3 | 15 |
+
+**测试流程**（每个关节独立执行）：
+
+```bash
+# 示例：测试左前髋外展
+sudo ./build/test_single_joint 0
+```
+
+程序自动运行两个阶段：
+1. **阶段 1（3 秒）**：静止保持，确认编码器读数稳定，打印 raw position
+2. **阶段 2（10 秒）**：±0.2 rad 正弦摆动（0.3Hz），屏幕提示该关节的**预期物理方向**，肉眼确认是否一致
+
+> Ctrl+C 随时停止，电机会缓慢归位后自动断电。
+
+**验证结果记录表**：
 
 | MPC 索引 | 物理关节 | 正方向含义 | 实测符合 |
 |---------|---------|-----------|---------|
@@ -236,21 +269,33 @@ mit_kd: 2.0
 
 ### Step 4：关节零偏标定
 
-将机器人放在标准夹具（四腿垂直地面），读取各电机当前编码器值：
+将机器人放在标准夹具上（四腿垂直地面），使用 `test_single_joint all` 读取全部电机编码器值：
 
 ```bash
-# 在 startup 阶段临时添加打印，或运行 pure_cpp 的单电机读取程序
-# joint_offset[i] = raw_position[i]（此时期望 q_mpc = 0）
+# [Jetson]
+sudo ./build/test_single_joint all
 ```
 
-更新 `config/robot_params.yaml`：
+输出示例：
 
-```yaml
+```
+┌─────────┬──────────────┬────────────┬────────────┬───────────────┐
+│ MPC Idx │ Joint        │ Raw Pos    │ Offset     │ q_mpc         │
+├─────────┼──────────────┼────────────┼────────────┼───────────────┤
+│       0 │     LF_HipA  │     0.3712 │     0.3700 │        0.0012 │
+│       1 │     LF_HipF  │     0.1298 │     0.1300 │       -0.0002 │
+│  ...    │    ...       │    ...     │    ...     │    ...        │
+└─────────┴──────────────┴────────────┴────────────┴───────────────┘
+
+# 便于复制的 yaml 格式（当前 Raw Pos 值）：
 joint_offsets:
-  hipa: [实测值_LF, 实测值_LR, 实测值_RF, 实测值_RR]
-  hipf: [实测值_LF, 实测值_LR, 实测值_RF, 实测值_RR]
-  knee: [实测值_LF, 实测值_LR, 实测值_RF, 实测值_RR]
+  hipa: [0.3712, -0.3698, -0.3705, 0.3701]
+  hipf: [0.1298, 0.1305, -0.1297, -0.1302]
+  knee: [1.7685, 1.7678, -1.7690, -1.7675]
 ```
+
+> 程序底部直接输出可复制的 yaml 格式，将 `Raw Pos` 列的值作为新的 `joint_offsets` 填入 `config/robot_params.yaml`。
+> ⚠️ 此命令以**零力矩**模式读取（kp=0, kd=0, torque_limit=0），电机不会产生任何运动。
 
 ### Step 5：IMU 坐标系验证
 

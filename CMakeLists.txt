@@ -167,6 +167,25 @@ target_link_libraries(test_mpc_solver
     ${CASADI_LINK_LIB}
 )
 
+# Single-joint hardware test (requires hardware + sudo)
+add_executable(test_single_joint
+    src/common/robot_config.cpp
+    ${HW_SOURCES}
+    tests/test_single_joint.cpp
+)
+target_include_directories(test_single_joint PUBLIC
+    include
+    ${PURE_CPP_DIR}/include
+    ${LIBUSB_INCLUDE_DIRS}
+    ${EIGEN3_INCLUDE_DIR}
+)
+target_link_libraries(test_single_joint
+    Threads::Threads
+    Eigen3::Eigen
+    yaml-cpp
+    ${LIBUSB_LIBRARIES}
+)
+
 # ============================================================
 # Build summary
 # ============================================================
