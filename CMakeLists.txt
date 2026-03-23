@@ -167,6 +167,25 @@ target_link_libraries(test_mpc_solver
     ${CASADI_LINK_LIB}
 )
 
+# IMU verification tool (no motors, safe to run anytime)
+add_executable(test_imu
+    src/common/robot_config.cpp
+    ${PURE_CPP_DIR}/src/imu/serial.c
+    ${PURE_CPP_DIR}/src/imu/wit_c_sdk.c
+    ${PURE_CPP_DIR}/src/observations.cpp
+    tests/test_imu.cpp
+)
+target_include_directories(test_imu PUBLIC
+    include
+    ${PURE_CPP_DIR}/include
+    ${EIGEN3_INCLUDE_DIR}
+)
+target_link_libraries(test_imu
+    Threads::Threads
+    Eigen3::Eigen
+    yaml-cpp
+)
+
 # Single-joint hardware test (requires hardware + sudo)
 add_executable(test_single_joint
     src/common/robot_config.cpp

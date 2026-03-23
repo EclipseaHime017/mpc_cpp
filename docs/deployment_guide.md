@@ -151,9 +151,13 @@ cmake --build build -j$(nproc)
 ```
 
 编译成功后产物：
-- `build/mpc_robot_control`   — 完整控制器（需要硬件）
-- `build/test_mpc_solver`     — 离线单元测试（不需要硬件）
-- `build/test_single_joint`   — 单关节硬件测试工具（需要硬件 + sudo）
+
+| 可执行文件 | 用途 | 需要电机 | 需要 sudo |
+|-----------|------|---------|----------|
+| `build/test_mpc_solver` | 离线数学验证（Step 2.4） | 否 | 否 |
+| `build/test_imu` | IMU 坐标系验证（Step 5） | 否 | 否 |
+| `build/test_single_joint` | 单关节方向 + 零偏标定（Step 3/4） | 是 | 是 |
+| `build/mpc_robot_control` | 完整控制器（Phase A–F） | 是 | 是 |
 
 ### 2.4 离线测试（不需要硬件）
 
@@ -299,21 +303,52 @@ joint_offsets:
 
 ### Step 5：IMU 坐标系验证
 
+> 使用专用工具 `test_imu`，**不涉及任何电机**，随时可安全运行。
+
 ```bash
-# [Jetson]
-sudo ./build/mpc_robot_control config/robot_params.yaml
+./build/test_imu config/robot_params.yaml
 ```
 
-机器人静止放平，观察终端输出：
+终端实时刷新，显示三组信息：
 
 ```
-[State] rpy=[ 0.001, -0.002,  1.571]   # roll≈0, pitch≈0 ✓
-        pos=[ 0.000,  0.000,  0.310]   # z ≈ target_z    ✓
-        omega=[0.000,  0.000,  0.000]  # 静止             ✓
+--- Raw (WIT frame: X=right, Y=forward, Z=up) ---
+  Quaternion [w,x,y,z]:  0.9999  0.0012  -0.0008  0.0031
+  Gyro [x,y,z] rad/s:    0.001   0.000   0.001
+  Accel [x,y,z] m/s²:    0.021  -0.015   9.812
+
+--- Body frame (after R_imu2body: X=forward, Y=left, Z=up) ---
+  RPY [roll,pitch,yaw] rad:      0.0011    -0.0008     1.5710
+  RPY [roll,pitch,yaw] deg:      0.063     -0.046      90.0
+  Omega [x,y,z] rad/s:           0.000      0.001      0.001
+  Gravity dir [x,y,z]:           0.001     -0.001     -1.000
+
+--- Sanity checks (robot flat on ground, stationary) ---
+  roll  (rad):    0.0011  (expect 0.0)  ✓
+  pitch (rad):   -0.0008  (expect 0.0)  ✓
+  grav_x     :    0.0010  (expect 0.0)  ✓
+  grav_y     :   -0.0010  (expect 0.0)  ✓
+  grav_z     :   -1.0001  (expect -1.0) ✓
+  omega_norm :    0.0014  (expect 0.0)  ✓
+  quat norm  :    1.0000  (expect 1.0)  ✓
 ```
 
-**若 roll/pitch 不为零**：调整 `src/estimator/state_estimator.cpp` 中的 `R_imu2body`。
-**若 z 偏差 >3cm**：检查 `target_z` 和运动学原点定义。
+**验证方法**：
+
+1. 将机器人平放在地面（无需上电），运行 `test_imu`
+2. 确认 sanity checks 全部显示 `✓`
+3. 缓慢倾斜机器人（侧倾），观察 `roll` 随之变化且方向正确（向右倾斜 → roll 为正）
+4. 缓慢前后倾，观察 `pitch` 方向正确（抬头 → pitch 为正）
+5. `Ctrl+C` 退出
+
+**若 sanity check 有 `✗`**：
+
+| 异常现象 | 原因 | 修复 |
+|---------|------|------|
+| roll/pitch 非零（机器人放平时） | `R_imu2body` 旋转轴对应关系错误 | 调整 `state_estimator.cpp` 中的 `R_imu2body` |
+| grav_z 不为 -1 | IMU Z 轴与机体 Z 轴反向 | `R_imu2body` 第三行取反 |
+| 倾斜时 roll/pitch 方向反 | 旋转符号错误 | `R_imu2body` 对应行取反 |
+| quat norm ≠ 1 | IMU 未完成初始化 | 等待 1–2 秒让 IMU 收敛后重试 |
 
 ---
 
