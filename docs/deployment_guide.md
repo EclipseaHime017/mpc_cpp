@@ -356,65 +356,114 @@ joint_offsets:
 
 > `[Jetson]` 所有测试均在 Jetson 上执行（需要 `sudo`）。
 
+**启动流程说明**（每个 Phase 通用）：
+
+```
+sudo ./build/mpc_robot_control config/robot_params.yaml
+  │
+  ├─ 自动：电机 Enable + 30步插值到站立姿态（约3s）
+  │
+  ├─ 打印：Press ENTER to start MPC control loop...
+  │         此处 Ctrl+C 可安全中断（电机归零后断电）
+  │
+  └─ 按 ENTER → 进入 500Hz 控制循环
+       ├─ 前 2s（calib_duration）：PD 保持站立 + IMU 标定
+       └─ 2s 后：MPC + 步态 + WBC 全部激活
+```
+
+**Phase 之间的切换**：每个 Phase 需要**重新启动**程序。流程：
+1. `Ctrl+C` 停止当前程序（电机归零断电）
+2. 编辑 `config/robot_params.yaml`
+3. 重新运行 `sudo ./build/mpc_robot_control config/robot_params.yaml`
+
+---
+
 ### Phase A：悬空站立
 
-> 机器人挂在支架上，腿完全悬空。
+**物理准备**：机器人挂在支架上，腿完全悬空。
 
+**修改 yaml**：
 ```yaml
 mit_kp: 30.0
 mit_kd: 1.5
-torque_limit: 15.0
+torque_limit: 15.0   # 低于电机上限 17Nm，留安全余量
 target_z: 0.20
 ```
 
+**运行**：
 ```bash
 sudo ./build/mpc_robot_control config/robot_params.yaml
+# 等待插值完成后按 ENTER
+# 观察 2s 标定阶段 + 控制循环启动
+# Ctrl+C 退出
 ```
 
-- [ ] 12 个关节在 3s 内缓慢插值到目标位置，无异响
+**检查项**：
+- [ ] 12 个关节在 3s 内缓慢运动到目标位置，无异响
 - [ ] 到位后静止，无持续抖动（若抖动：降低 `mit_kp`）
-- [ ] `Ctrl+C` 后电机平滑停止
+- [ ] `Ctrl+C` 后电机平滑停止（归零力矩）
+
+---
 
 ### Phase B：地面静止站立
 
-> 放到地面，**手扶机身**。
+**物理准备**：机器人放到地面，**手扶机身**。
 
+**修改 yaml**（相对 Phase A 提高刚度）：
 ```yaml
 mit_kp: 40.0
 mit_kd: 0.5
-torque_limit: 20.0
+torque_limit: 15.0   # 保持不变；mit_torque_limit: 17.0 是电机硬件上限，不要修改
 ```
 
+**运行**：同 Phase A，等待插值后按 ENTER，此时 MPC 已在后台运行但机器人静止。
+
+**检查项**：
 - [ ] 站立高度 ≈ `target_z`（卷尺验证）
-- [ ] 四腿均匀受力（体重秤验证，误差 < 20%）
+- [ ] 四腿均匀受力（体重秤，误差 < 20%）
 - [ ] 轻推后能恢复
 - [ ] 静止 30s，电机温度 < 60°C
 
-### Phase C：MPC GRF 验证（静止）
+---
 
-开启 MPC，观察地面反力输出：
+### Phase C：MPC GRF 验证
+
+**无需重启**，在 Phase B 按下 ENTER 后 MPC 已自动运行。观察终端输出：
 
 ```
 [MPC] fz=[29.5, 29.3, 29.4, 29.5]N   sum=117.7N   ✓
 [MPC] solve_time=2.4ms                              ✓
 ```
 
-- [ ] 四腿法向力之和 ≈ `mass × 9.81`（允许 ±15%）
-- [ ] `solve_time` < 5ms
+> Phase B 和 Phase C 是**同一次运行**的不同观测维度：B 看物理姿态，C 看终端数值。
+
+**检查项**：
+- [ ] 四腿法向力之和 ≈ `mass × 9.81 = 117.7N`（允许 ±15%）
+- [ ] `solve_time` < 5ms 且稳定
+
+---
 
 ### Phase D：原地踏步
 
+**修改 yaml**（相对 Phase B/C）：
 ```yaml
 gait_period: 0.5
 step_height: 0.04
-ipopt_max_iter: 0      # 先关 NMPC
+ipopt_max_iter: 0    # 先关 NMPC，只用 ConvexMPC
 ```
 
-- [ ] 摆腿轨迹平滑，无碰地
-- [ ] 步态周期与设置吻合（秒表验证）
+**运行**：启动后按 ENTER，手柄**零输入**，机器人应在原地 trot。
+
+**检查项**：
+- [ ] 摆腿轨迹平滑，无碰地或突变
+- [ ] 步态周期与 `gait_period` 吻合（秒表验证）
+- [ ] 站立腿 GRF 连续（终端无突变打印）
+
+---
 
 ### Phase E：慢速直行
 
+**修改 yaml**：
 ```yaml
 gait_period: 0.4
 step_height: 0.06

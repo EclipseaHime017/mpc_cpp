@@ -21,6 +21,8 @@
 #include <chrono>
 #include <csignal>
 #include <cstring>
+#include <unistd.h>
+#include <sys/select.h>
 #include <sys/mman.h>
 #include <pthread.h>
 #include <sched.h>
@@ -355,7 +357,22 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     std::cout << "Press ENTER to start MPC control loop (Ctrl+C to abort)...\n";
-    std::cin.get();
+    // Poll stdin every 100ms so Ctrl+C is detected without waiting for ENTER.
+    // Plain cin.get() is restarted by the kernel after SIGINT (SA_RESTART),
+    // so it never returns on Ctrl+C alone.
+    {
+        bool entered = false;
+        while (g_running && !entered) {
+            fd_set fds;
+            FD_ZERO(&fds);
+            FD_SET(STDIN_FILENO, &fds);
+            struct timeval tv{0, 100000};  // 100ms
+            if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) > 0) {
+                std::cin.get();
+                entered = true;
+            }
+        }
+    }
     if (!g_running) {
         std::cout << "[Shutdown] Interrupted at ENTER prompt.\n";
         for (int i = 0; i < 12; ++i) {
