@@ -348,13 +348,21 @@ int main(int argc, char* argv[]) {
 
     if (!g_running) {
         std::cout << "[Shutdown] Interrupted during startup.\n";
-        goto shutdown;
+        for (int i = 0; i < 12; ++i) {
+            rs->SendMITCommand(motor_indices[i], 0.0f);
+            rs->DisableMotor(motor_indices[i]);
+        }
+        return 0;
     }
     std::cout << "Press ENTER to start MPC control loop (Ctrl+C to abort)...\n";
     std::cin.get();
     if (!g_running) {
         std::cout << "[Shutdown] Interrupted at ENTER prompt.\n";
-        goto shutdown;
+        for (int i = 0; i < 12; ++i) {
+            rs->SendMITCommand(motor_indices[i], 0.0f);
+            rs->DisableMotor(motor_indices[i]);
+        }
+        return 0;
     }
 
     auto imu_comp = std::make_shared<IMUComponent>(cfg.imu_device.c_str());
