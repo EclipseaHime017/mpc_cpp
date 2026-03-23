@@ -168,8 +168,12 @@ target_link_libraries(test_mpc_solver
 )
 
 # IMU verification tool (no motors, safe to run anytime)
+# observations.cpp pulls in JointComponent which references RobstrideController,
+# so robstride.cpp + can_interface.cpp must be linked even though we don't use motors.
 add_executable(test_imu
     src/common/robot_config.cpp
+    ${PURE_CPP_DIR}/src/robstride.cpp
+    ${PURE_CPP_DIR}/src/can/can_interface.cpp
     ${PURE_CPP_DIR}/src/imu/serial.c
     ${PURE_CPP_DIR}/src/imu/wit_c_sdk.c
     ${PURE_CPP_DIR}/src/observations.cpp
@@ -178,12 +182,14 @@ add_executable(test_imu
 target_include_directories(test_imu PUBLIC
     include
     ${PURE_CPP_DIR}/include
+    ${LIBUSB_INCLUDE_DIRS}
     ${EIGEN3_INCLUDE_DIR}
 )
 target_link_libraries(test_imu
     Threads::Threads
     Eigen3::Eigen
     yaml-cpp
+    ${LIBUSB_LIBRARIES}
 )
 
 # Single-joint hardware test (requires hardware + sudo)
