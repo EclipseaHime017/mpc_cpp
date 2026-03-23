@@ -318,9 +318,12 @@ int main(int argc, char* argv[]) {
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
         std::cerr << "[WARN] mlockall failed (run as root for real-time performance)\n";
     }
-    // Pre-touch stack to avoid runtime stack growth faults
-    char stack_prefault[8 * 1024 * 1024];
-    std::memset(stack_prefault, 0, sizeof(stack_prefault));
+    // Pre-touch stack: use 512KB (safe within default 8MB stack limit).
+    // The original 8MB allocation overflows the default Jetson stack.
+    // Increase system stack first if a larger pre-fault is needed:
+    //   sudo bash -c 'echo "* soft stack unlimited" >> /etc/security/limits.conf'
+    volatile char stack_prefault[512 * 1024];
+    std::memset((void*)stack_prefault, 0, sizeof(stack_prefault));
 
     // Load configuration (non-const: nominal_foot_offsets will be calibrated at runtime)
     std::string config_path = (argc > 1) ? argv[1] : "config/robot_params.yaml";
