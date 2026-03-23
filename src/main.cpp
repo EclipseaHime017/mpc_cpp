@@ -44,7 +44,11 @@
 // Globals
 // ============================================================
 static std::atomic<bool> g_running{true};
-static void signal_handler(int) { g_running = false; }
+static std::atomic<bool> g_reload_config{false};  // set by SIGUSR1
+static void signal_handler(int sig) {
+    if (sig == SIGUSR1) g_reload_config = true;
+    else                g_running = false;
+}
 
 // Motor setup (matching pure_cpp/main.cpp)
 static const std::vector<char> CAN_IDS = {'0', '1', '2', '3'};
@@ -104,7 +108,7 @@ static void startup_motors(std::shared_ptr<RobstrideController> rs,
 
     // Interpolate to default pose (joint_offsets = stand position)
     const int STEPS = 30;
-    for (int step = 1; step <= STEPS; ++step) {
+    for (int step = 1; step <= STEPS && g_running; ++step) {
         float factor = (float)step / STEPS;
         for (int global_idx = 0; global_idx < 12; ++global_idx) {
             float target = (float)cfg.joint_offsets[global_idx] * factor;
@@ -112,7 +116,8 @@ static void startup_motors(std::shared_ptr<RobstrideController> rs,
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
     }
-    std::cout << "[Startup] Motors initialized and at stand pose.\n";
+    if (g_running)
+        std::cout << "[Startup] Motors initialized and at stand pose.\n";
 }
 
 // ============================================================
@@ -313,6 +318,7 @@ static void mpc_thread_fn(RobotConfig cfg,   // own copy so nominal_foot_offsets
 int main(int argc, char* argv[]) {
     std::signal(SIGINT,  signal_handler);
     std::signal(SIGTERM, signal_handler);
+    std::signal(SIGUSR1, signal_handler);  // kill -USR1 <pid> → hot-reload yaml
 
     // Lock all memory pages to prevent page faults in realtime thread
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
@@ -345,8 +351,16 @@ int main(int argc, char* argv[]) {
     std::vector<int> motor_indices(12);
     startup_motors(rs, motor_indices, cfg);
 
-    std::cout << "Press ENTER to start MPC control loop...\n";
+    if (!g_running) {
+        std::cout << "[Shutdown] Interrupted during startup.\n";
+        goto shutdown;
+    }
+    std::cout << "Press ENTER to start MPC control loop (Ctrl+C to abort)...\n";
     std::cin.get();
+    if (!g_running) {
+        std::cout << "[Shutdown] Interrupted at ENTER prompt.\n";
+        goto shutdown;
+    }
 
     auto imu_comp = std::make_shared<IMUComponent>(cfg.imu_device.c_str());
     auto gamepad  = std::make_shared<Gamepad>(cfg.gamepad_dev.c_str());
@@ -556,10 +570,47 @@ int main(int argc, char* argv[]) {
             last_print = now;
         }
 
+        // ===== 12. yaml hot-reload (SIGUSR1) =====
+        // Reloads gains, limits, gait params — no motor reinitialization.
+        // Usage: kill -USR1 $(pgrep mpc_robot_control)
+        if (g_reload_config.exchange(false)) {
+            RobotConfig new_cfg = RobotConfig::from_yaml(config_path);
+            // Update only "safe at runtime" parameters
+            cfg.mit_kp              = new_cfg.mit_kp;
+            cfg.mit_kd              = new_cfg.mit_kd;
+            cfg.mit_torque_limit    = new_cfg.mit_torque_limit;
+            cfg.torque_limit        = new_cfg.torque_limit;
+            cfg.kp_stand            = new_cfg.kp_stand;
+            cfg.kd_stand            = new_cfg.kd_stand;
+            cfg.kp_swing            = new_cfg.kp_swing;
+            cfg.kd_swing            = new_cfg.kd_swing;
+            cfg.kp_stance           = new_cfg.kp_stance;
+            cfg.kd_stance           = new_cfg.kd_stance;
+            cfg.step_height         = new_cfg.step_height;
+            cfg.gait_period         = new_cfg.gait_period;
+            cfg.duty_factor         = new_cfg.duty_factor;
+            cfg.target_z            = new_cfg.target_z;
+            cfg.weights_Q           = new_cfg.weights_Q;
+            cfg.weights_R           = new_cfg.weights_R;
+            cfg.ipopt_max_iter      = new_cfg.ipopt_max_iter;
+            cfg.ipopt_tol           = new_cfg.ipopt_tol;
+            // Push new MIT params to all motors
+            for (int i = 0; i < 12; ++i) {
+                rs->SetMITParams(motor_indices[i], {
+                    (float)cfg.mit_kp, (float)cfg.mit_kd,
+                    (float)cfg.mit_vel_limit, (float)cfg.mit_torque_limit
+                });
+            }
+            std::printf("[Config] Hot-reloaded %s | kp=%.1f kd=%.2f tlim=%.1f step_h=%.3f\n",
+                        config_path.c_str(), cfg.mit_kp, cfg.mit_kd,
+                        cfg.torque_limit, cfg.step_height);
+        }
+
         std::this_thread::sleep_until(next_500hz);
     }
 
     // ===== Shutdown =====
+    shutdown:
     std::cout << "[Shutdown] Stopping...\n";
     g_running = false;
     if (mpc_th.joinable()) mpc_th.join();
