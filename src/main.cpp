@@ -70,6 +70,24 @@ static const std::vector<int> MOTOR_IDS = {1,5,9,13, 2,6,10,14, 3,7,11,15};
 // RR_HipA=3, RR_HipF=7, RR_Knee=11  -> MPC[9]=motor[3], MPC[10]=motor[7], MPC[11]=motor[11]
 static const int MPC_TO_MOTOR_IDX[12] = {0,4,8, 1,5,9, 2,6,10, 3,7,11};
 
+// Per-joint position limits in RAW motor space (with offset, before gear-ratio removal).
+// Copied from pure_cpp/Main/src/main.cpp (xml_min / xml_max).
+// Index order: [LF_HipA, LR_HipA, RF_HipA, RR_HipA,
+//               LF_HipF, LR_HipF, RF_HipF, RR_HipF,
+//               LF_Knee, LR_Knee, RF_Knee, RR_Knee]
+static const float JOINT_RAW_MIN[12] = {
+    -0.7853982f, -0.7853982f, -0.7853982f, -0.7853982f,  // HipA
+    -1.2217658f, -1.2217305f, -0.8726999f, -0.8726999f,  // HipF
+    -1.2217299f * 1.667f, -1.2217299f * 1.667f, -0.6f, -0.6f  // Knee (gear-ratio applied)
+};
+static const float JOINT_RAW_MAX[12] = {
+     0.7853982f,  0.7853982f,  0.7853982f,  0.7853982f,  // HipA
+     0.8726683f,  0.8726683f,  1.2217342f,  1.2217305f,  // HipF
+     0.6f, 0.6f, 1.2217287f * 1.667f, 1.2217287f * 1.667f  // Knee
+};
+// Safety margin: trigger emergency stop if actual position exceeds limit by this amount
+static constexpr float JOINT_LIMIT_MARGIN = 0.1f;  // rad
+
 // ============================================================
 // Motor startup: initialize all 12 motors, interpolate to stand pose
 // ============================================================
@@ -178,23 +196,27 @@ static void read_joints(const std::shared_ptr<RobstrideController>& rs,
 }
 
 // ============================================================
-// Send joint torques + PD position tracking via MIT mode
+// Send full MIT commands: position + velocity + PD gains + feedforward torque
 // ============================================================
+// The Robstride MIT mode executes at ~10kHz on the motor driver:
+//   τ_motor = kp*(pos_des - pos) + kd*(vel_des - vel) + tau_ff
+//
+// For stance legs: pos=stand angle, kp/kd=stance gains, tau_ff=WBC torque (J^T * f_mpc)
+// For swing legs:  pos=swing target, kp/kd=swing gains, tau_ff=0
+//
+// Knee joints have gear_ratio=1.667, requiring conversion:
+//   pos_motor = pos_joint * gear + offset
+//   kp_motor  = kp_joint / gear^2    (so joint sees correct stiffness)
+//   kd_motor  = kd_joint / gear^2
+//   tau_motor = tau_joint / gear      (power conservation: τ₁ω₁ = τ₂ω₂)
 static void send_motor_commands(const std::shared_ptr<RobstrideController>& rs,
                                  const std::vector<int>& motor_indices,
                                  const RobotConfig& cfg,
-                                 const Eigen::Matrix<double,12,1>& q_mpc,
-                                 const Eigen::Matrix<double,12,1>& tau,
                                  const Eigen::Matrix<double,12,1>& q_des,
+                                 const Eigen::Matrix<double,12,1>& tau_ff,
                                  const Eigen::Matrix<double,12,1>& kp_vec,
                                  const Eigen::Matrix<double,12,1>& kd_vec)
 {
-    // The Robstride MIT mode executes: tau_actual = kp*(q_des - q) + kd*(0 - dq) + tau_ff
-    // We embed our desired position and reduced kp/kd alongside the WBC feedforward torque.
-    // However, the current pure_cpp SendMITCommand API only takes position.
-    // As a workaround: send position = q_des (raw, with offset) and use the configured KP/KD.
-    // The feedforward torque is injected by setting target = q_des + tau/(kp+eps) (tau trick).
-    // TODO: Extend RobstrideController to support full MIT command (pos + vel + kp + kd + tau_ff).
     for (int mpc_idx = 0; mpc_idx < 12; ++mpc_idx) {
         int motor_global_idx = MPC_TO_MOTOR_IDX[mpc_idx];
         int motor_idx = motor_indices[motor_global_idx];
@@ -202,14 +224,30 @@ static void send_motor_commands(const std::shared_ptr<RobstrideController>& rs,
 
         bool is_knee = (mpc_idx % 3 == 2);
         double gear  = is_knee ? cfg.knee_gear_ratio : 1.0;
+        double gear2 = gear * gear;
 
-        // Convert MPC joint angle back to raw motor angle (with offset)
-        double q_raw_des = q_des[mpc_idx] * gear + offset;
-        // Clamp to safe range
-        const double MAX_ANG = 12.57;  // MIT mode limit
-        q_raw_des = math_utils::clamp(q_raw_des, -MAX_ANG, MAX_ANG);
+        // Convert joint space → motor shaft space
+        double pos_raw = q_des[mpc_idx] * gear + offset;
+        double kp_raw  = kp_vec[mpc_idx] / gear2;
+        double kd_raw  = kd_vec[mpc_idx] / gear2;
+        double tau_raw = tau_ff[mpc_idx] / gear;
 
-        rs->SendMITCommand(motor_idx, (float)q_raw_des);
+        // Clamp position to per-joint physical limits
+        pos_raw = math_utils::clamp(pos_raw,
+                                     (double)JOINT_RAW_MIN[motor_global_idx],
+                                     (double)JOINT_RAW_MAX[motor_global_idx]);
+
+        // Clamp torque feedforward to hardware limit
+        tau_raw = math_utils::clamp(tau_raw,
+                                     -cfg.mit_torque_limit,
+                                      cfg.mit_torque_limit);
+
+        // Clamp kp/kd to Robstride register limits (kp: 0~500, kd: 0~5)
+        kp_raw = math_utils::clamp(kp_raw, 0.0, 500.0);
+        kd_raw = math_utils::clamp(kd_raw, 0.0, 5.0);
+
+        rs->SendMITCommand(motor_idx, (float)pos_raw, 0.0f,
+                           (float)kp_raw, (float)kd_raw, (float)tau_raw);
     }
 }
 
@@ -454,6 +492,30 @@ int main(int argc, char* argv[]) {
         Eigen::Matrix<double,12,1> q_mpc, dq_mpc, tau_est;
         read_joints(rs, motor_indices, cfg, q_mpc, dq_mpc, tau_est);
 
+        // ===== 1b. Joint limit safety check =====
+        // Compare actual raw motor positions against physical limits.
+        // If any joint exceeds its limit + margin, trigger emergency stop.
+        {
+            bool limit_violated = false;
+            for (int mpc_idx = 0; mpc_idx < 12; ++mpc_idx) {
+                int gi = MPC_TO_MOTOR_IDX[mpc_idx];
+                int midx = motor_indices[gi];
+                float raw_pos = rs->GetMotorState(midx).position;
+                if (raw_pos < JOINT_RAW_MIN[gi] - JOINT_LIMIT_MARGIN ||
+                    raw_pos > JOINT_RAW_MAX[gi] + JOINT_LIMIT_MARGIN) {
+                    std::cerr << "[SAFETY] Joint " << mpc_idx
+                              << " raw_pos=" << raw_pos
+                              << " outside [" << JOINT_RAW_MIN[gi] << ", "
+                              << JOINT_RAW_MAX[gi] << "] — EMERGENCY STOP\n";
+                    limit_violated = true;
+                }
+            }
+            if (limit_violated) {
+                g_running = false;
+                break;
+            }
+        }
+
         // ===== 2. State estimation =====
         estimator.update(imu_data, q_mpc, dq_mpc, tau_est, dt, startup_time);
         const RobotState& state = estimator.state();
@@ -480,18 +542,12 @@ int main(int argc, char* argv[]) {
         // ===== 5. Calibration phase (first calib_duration seconds) =====
         if (startup_time < cfg.calib_duration) {
             // Hold at stand pose with high stiffness
-            double alpha = std::min(startup_time / cfg.calib_duration, 1.0);
-            Eigen::Matrix<double,12,1> tau = Eigen::Matrix<double,12,1>::Zero();
-            // Simple PD to hold at zero (offset position)
-            tau = cfg.kp_stand * (Eigen::Matrix<double,12,1>::Zero() - q_mpc)
-                - cfg.kd_stand * dq_mpc;
-            tau = tau.cwiseMax(-cfg.torque_limit).cwiseMin(cfg.torque_limit);
-
-            // Send motors
+            // Phase B: PD stand — motor holds at zero offset position, no feedforward torque
             Eigen::Matrix<double,12,1> q_des_stand = Eigen::Matrix<double,12,1>::Zero();
+            Eigen::Matrix<double,12,1> tau_ff_stand = Eigen::Matrix<double,12,1>::Zero();
             Eigen::Matrix<double,12,1> kp_vec = Eigen::Matrix<double,12,1>::Constant(cfg.kp_stand);
             Eigen::Matrix<double,12,1> kd_vec = Eigen::Matrix<double,12,1>::Constant(cfg.kd_stand);
-            send_motor_commands(rs, motor_indices, cfg, q_mpc, tau, q_des_stand, kp_vec, kd_vec);
+            send_motor_commands(rs, motor_indices, cfg, q_des_stand, tau_ff_stand, kp_vec, kd_vec);
 
             if (startup_time > cfg.calib_duration - 0.05 && !calib_done) {
                 // Calibrate nominal foot offsets from current kinematics
@@ -541,8 +597,11 @@ int main(int argc, char* argv[]) {
 
         Eigen::Matrix<double,12,1> tau_wbc = wbc.compute(wbc_in);
 
-        // ===== 9. PD feedback (500Hz) =====
-        Eigen::Matrix<double,12,1> tau    = Eigen::Matrix<double,12,1>::Zero();
+        // ===== 9. Compute motor targets (500Hz) =====
+        // PD position tracking is handled by the motor's internal MIT controller (~10kHz).
+        // We only compute: q_des (target angle), kp/kd (per-joint gains), tau_ff (WBC feedforward).
+        // Motor executes: τ = kp*(q_des - q) + kd*(0 - dq) + tau_ff
+        Eigen::Matrix<double,12,1> tau_ff = Eigen::Matrix<double,12,1>::Zero();
         Eigen::Matrix<double,12,1> q_des  = Eigen::Matrix<double,12,1>::Zero();
         Eigen::Matrix<double,12,1> kp_vec = Eigen::Matrix<double,12,1>::Zero();
         Eigen::Matrix<double,12,1> kd_vec = Eigen::Matrix<double,12,1>::Zero();
@@ -550,17 +609,13 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < 4; ++i) {
             int idx = i * 3;
             if (gait_out.contact[i]) {
-                // Stance: PD to hold stand joint angles + WBC feedforward
-                Eigen::Vector3d q_err  = cfg.stand_joint_angles.segment<3>(idx) - q_mpc.segment<3>(idx);
-                Eigen::Vector3d dq_err = -dq_mpc.segment<3>(idx);
-                tau.segment<3>(idx) = tau_wbc.segment<3>(idx)
-                                     + cfg.kp_stance * q_err
-                                     + cfg.kd_stance * dq_err;
-                q_des.segment<3>(idx) = cfg.stand_joint_angles.segment<3>(idx);
+                // Stance: hold stand pose + WBC feedforward torque (J^T * f_mpc)
+                q_des.segment<3>(idx)  = cfg.stand_joint_angles.segment<3>(idx);
                 kp_vec.segment<3>(idx).setConstant(cfg.kp_stance);
                 kd_vec.segment<3>(idx).setConstant(cfg.kd_stance);
+                tau_ff.segment<3>(idx) = tau_wbc.segment<3>(idx);
             } else {
-                // Swing: IK-based trajectory tracking
+                // Swing: IK-based trajectory tracking, no feedforward torque
                 if (prev_contact[i]) {
                     q_des_swing.segment<3>(idx) = q_mpc.segment<3>(idx);
                 }
@@ -571,7 +626,7 @@ int main(int argc, char* argv[]) {
                 Eigen::Vector3d v_cart_cmd = gait_out.foot_target_vel.row(i).transpose()
                                             + 20.0 * p_err;
 
-                Eigen::Matrix3d J_body  = kin.jacobian(i, q_mpc.segment<3>(idx));  // NOLINT
+                Eigen::Matrix3d J_body  = kin.jacobian(i, q_mpc.segment<3>(idx));
                 Eigen::Matrix3d J_world = state.rot_mat * J_body;
                 Eigen::Matrix3d JJT     = J_world * J_world.transpose()
                                          + 1e-3 * Eigen::Matrix3d::Identity();
@@ -580,25 +635,20 @@ int main(int argc, char* argv[]) {
 
                 q_des_swing.segment<3>(idx) += dq_des * dt;
 
-                Eigen::Vector3d q_err  = q_des_swing.segment<3>(idx) - q_mpc.segment<3>(idx);
-                Eigen::Vector3d dq_err = dq_des - dq_mpc.segment<3>(idx);
-                tau.segment<3>(idx) = tau_wbc.segment<3>(idx)
-                                     + cfg.kp_swing * q_err
-                                     + cfg.kd_swing * dq_err;
-                q_des.segment<3>(idx) = q_des_swing.segment<3>(idx);
+                q_des.segment<3>(idx)  = q_des_swing.segment<3>(idx);
                 kp_vec.segment<3>(idx).setConstant(cfg.kp_swing);
                 kd_vec.segment<3>(idx).setConstant(cfg.kd_swing);
+                // tau_ff remains 0 for swing legs
             }
         }
 
         for (int i = 0; i < 4; ++i) prev_contact[i] = gait_out.contact[i];
 
-        // Safety: clamp and NaN check
-        if (tau.hasNaN()) tau.setZero();
-        tau = tau.cwiseMax(-cfg.torque_limit).cwiseMin(cfg.torque_limit);
+        // Safety: NaN check on WBC output
+        if (tau_ff.hasNaN()) tau_ff.setZero();
 
         // ===== 10. Send motor commands =====
-        send_motor_commands(rs, motor_indices, cfg, q_mpc, tau, q_des, kp_vec, kd_vec);
+        send_motor_commands(rs, motor_indices, cfg, q_des, tau_ff, kp_vec, kd_vec);
 
         // ===== 11. Debug print (every 0.5s) =====
         if (std::chrono::duration<double>(now - last_print).count() >= 0.5) {

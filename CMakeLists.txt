@@ -87,17 +87,17 @@ endif()
 pkg_check_modules(LIBUSB REQUIRED libusb-1.0)
 
 # ============================================================
-# Source files from pure_cpp (hardware communication layer)
+# Hardware driver sources (decoupled copy from pure_cpp)
 # ============================================================
 
-set(PURE_CPP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../pure_cpp/Main)
+set(DRIVER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/driver)
 
 set(HW_SOURCES
-    ${PURE_CPP_DIR}/src/robstride.cpp
-    ${PURE_CPP_DIR}/src/can/can_interface.cpp
-    ${PURE_CPP_DIR}/src/imu/serial.c
-    ${PURE_CPP_DIR}/src/imu/wit_c_sdk.c
-    ${PURE_CPP_DIR}/src/observations.cpp       # For IMUComponent, Gamepad
+    ${DRIVER_DIR}/src/robstride.cpp
+    ${DRIVER_DIR}/src/can_interface.cpp
+    ${DRIVER_DIR}/src/serial.c
+    ${DRIVER_DIR}/src/wit_c_sdk.c
+    ${DRIVER_DIR}/src/observations.cpp
 )
 
 # ============================================================
@@ -126,7 +126,7 @@ add_executable(mpc_robot_control
 
 target_include_directories(mpc_robot_control PUBLIC
     include
-    ${PURE_CPP_DIR}/include
+    ${DRIVER_DIR}/include
     ${LIBUSB_INCLUDE_DIRS}
     ${EIGEN3_INCLUDE_DIR}
     ${CASADI_INCLUDE_DIRS}
@@ -172,16 +172,16 @@ target_link_libraries(test_mpc_solver
 # so robstride.cpp + can_interface.cpp must be linked even though we don't use motors.
 add_executable(test_imu
     src/common/robot_config.cpp
-    ${PURE_CPP_DIR}/src/robstride.cpp
-    ${PURE_CPP_DIR}/src/can/can_interface.cpp
-    ${PURE_CPP_DIR}/src/imu/serial.c
-    ${PURE_CPP_DIR}/src/imu/wit_c_sdk.c
-    ${PURE_CPP_DIR}/src/observations.cpp
+    ${DRIVER_DIR}/src/robstride.cpp
+    ${DRIVER_DIR}/src/can_interface.cpp
+    ${DRIVER_DIR}/src/serial.c
+    ${DRIVER_DIR}/src/wit_c_sdk.c
+    ${DRIVER_DIR}/src/observations.cpp
     tests/test_imu.cpp
 )
 target_include_directories(test_imu PUBLIC
     include
-    ${PURE_CPP_DIR}/include
+    ${DRIVER_DIR}/include
     ${LIBUSB_INCLUDE_DIRS}
     ${EIGEN3_INCLUDE_DIR}
 )
@@ -200,7 +200,7 @@ add_executable(test_single_joint
 )
 target_include_directories(test_single_joint PUBLIC
     include
-    ${PURE_CPP_DIR}/include
+    ${DRIVER_DIR}/include
     ${LIBUSB_INCLUDE_DIRS}
     ${EIGEN3_INCLUDE_DIR}
 )
@@ -220,6 +220,6 @@ message(STATUS "Build type:    ${CMAKE_BUILD_TYPE}")
 message(STATUS "CXX flags:     ${CMAKE_CXX_FLAGS_RELEASE}")
 message(STATUS "Eigen3:        ${EIGEN3_VERSION}")
 message(STATUS "OSQP wrapper:  ${OSQP_CPP_LIB}")
-message(STATUS "pure_cpp dir:  ${PURE_CPP_DIR}")
+message(STATUS "driver dir:    ${DRIVER_DIR}")
 message(STATUS "=============================")
 message(STATUS "")
