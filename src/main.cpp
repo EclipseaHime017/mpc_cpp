@@ -122,18 +122,30 @@ static void startup_motors(std::shared_ptr<RobstrideController> rs,
         }
     }
 
-    // Interpolate to default pose (joint_offsets = stand position)
-    const int STEPS = 30;
+    // Wait for first encoder feedback from all motors before reading positions
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    // Read current encoder positions as interpolation start points.
+    // This avoids the jolt that would occur if we always interpolated from 0.
+    float start_pos[12];
+    for (int global_idx = 0; global_idx < 12; ++global_idx) {
+        start_pos[global_idx] = rs->GetMotorState(motor_indices[global_idx]).position;
+    }
+    std::cout << "[Startup] Interpolating from current encoder positions to stand pose...\n";
+
+    // Interpolate all joints simultaneously: 100 steps × 20ms = 2 seconds
+    const int STEPS = 100;
     for (int step = 1; step <= STEPS && g_running; ++step) {
-        float factor = (float)step / STEPS;
+        float alpha = (float)step / STEPS;
         for (int global_idx = 0; global_idx < 12; ++global_idx) {
-            float target = (float)cfg.joint_offsets[global_idx] * factor;
+            float target = start_pos[global_idx]
+                         + alpha * ((float)cfg.joint_offsets[global_idx] - start_pos[global_idx]);
             rs->SendMITCommand(motor_indices[global_idx], target);
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     if (g_running)
-        std::cout << "[Startup] Motors initialized and at stand pose.\n";
+        std::cout << "[Startup] Motors at stand pose.\n";
 }
 
 // ============================================================
@@ -556,7 +568,6 @@ int main(int argc, char* argv[]) {
             if (startup_time > cfg.calib_duration - 0.05 && !calib_done) {
                 // Calibrate nominal foot offsets from current kinematics
                 cfg.nominal_foot_offsets = state.foot_pos_body;
-                nmpc_foot_cache = state.foot_pos_world;
                 q_des_swing = q_mpc;
                 calib_done = true;
                 std::cout << "[Calib] Nominal foot offsets calibrated.\n";
@@ -701,8 +712,8 @@ int main(int argc, char* argv[]) {
             if (!gait_active) {
                 // Print MPC GRF for operator verification
                 std::printf(" | fz=[%.1f,%.1f,%.1f,%.1f]N",
-                            mpc_cache.f_stance[2], mpc_cache.f_stance[5],
-                            mpc_cache.f_stance[8], mpc_cache.f_stance[11]);
+                            mpc_cache.f_stance(0,2), mpc_cache.f_stance(1,2),
+                            mpc_cache.f_stance(2,2), mpc_cache.f_stance(3,2));
             }
             std::printf("\n");
             last_print = now;
