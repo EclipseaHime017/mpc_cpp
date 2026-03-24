@@ -66,18 +66,24 @@ static const int MPC_TO_MOTOR_IDX[12] = {0,4,8, 1,5,9, 2,6,10, 3,7,11};
 // Index order: [LF_HipA, LR_HipA, RF_HipA, RR_HipA,
 //               LF_HipF, LR_HipF, RF_HipF, RR_HipF,
 //               LF_Knee, LR_Knee, RF_Knee, RR_Knee]
-static const float JOINT_RAW_MIN[12] = {
-    -0.7853982f, -0.7853982f, -0.7853982f, -0.7853982f,  // HipA
-    -1.2217658f, -1.2217305f, -0.8726999f, -0.8726999f,  // HipF
-    -1.2217299f * 1.667f, -1.2217299f * 1.667f, -0.6f, -0.6f  // Knee (gear-ratio applied)
+// Per-joint limits expressed as MOTOR SHAFT DISPLACEMENT from stand pose:
+//   shaft_disp = raw_encoder - joint_offset
+// At stand pose shaft_disp = 0. Knee values include the gear ratio (joint * 1.667).
+// Index order: [LF_HipA, LR_HipA, RF_HipA, RR_HipA,
+//               LF_HipF, LR_HipF, RF_HipF, RR_HipF,
+//               LF_Knee, LR_Knee, RF_Knee, RR_Knee]
+static const float JOINT_SHAFT_MIN[12] = {
+    -0.7853982f, -0.7853982f, -0.7853982f, -0.7853982f,  // HipA  (gear=1, same as joint)
+    -1.2217658f, -1.2217305f, -0.8726999f, -0.8726999f,  // HipF  (gear=1)
+    -1.2217299f * 1.667f, -1.2217299f * 1.667f, -0.6f, -0.6f  // Knee shaft
 };
-static const float JOINT_RAW_MAX[12] = {
+static const float JOINT_SHAFT_MAX[12] = {
      0.7853982f,  0.7853982f,  0.7853982f,  0.7853982f,  // HipA
      0.8726683f,  0.8726683f,  1.2217342f,  1.2217305f,  // HipF
-     0.6f, 0.6f, 1.2217287f * 1.667f, 1.2217287f * 1.667f  // Knee
+     0.6f, 0.6f, 1.2217287f * 1.667f, 1.2217287f * 1.667f  // Knee shaft
 };
-// Safety margin: trigger emergency stop if actual position exceeds limit by this amount
-static constexpr float JOINT_LIMIT_MARGIN = 0.1f;  // rad
+// Emergency stop margin applied on top of shaft limits [rad]
+static constexpr float JOINT_LIMIT_MARGIN = 0.1f;
 
 // ============================================================
 // Motor startup: initialize all 12 motors, interpolate to stand pose
@@ -198,21 +204,22 @@ static bool read_joints_safe(const std::shared_ptr<RobstrideController>& rs,
         // Single read — holds motor_data_mutex for one call only
         auto ms = rs->GetMotorState(motor_idx);
 
-        // --- Limit check (raw motor space) ---
-        if (ms.position < JOINT_RAW_MIN[gi] - JOINT_LIMIT_MARGIN ||
-            ms.position > JOINT_RAW_MAX[gi] + JOINT_LIMIT_MARGIN) {
+        // --- Limit check in shaft-displacement space (raw - offset) ---
+        double offset      = cfg.joint_offsets[gi];
+        float shaft_disp   = ms.position - (float)offset;
+        if (shaft_disp < JOINT_SHAFT_MIN[gi] - JOINT_LIMIT_MARGIN ||
+            shaft_disp > JOINT_SHAFT_MAX[gi] + JOINT_LIMIT_MARGIN) {
             std::cerr << "[SAFETY] Joint " << mpc_idx
                       << " (motor_id=" << cfg.motor_ids[gi]
-                      << ") raw_pos=" << ms.position
+                      << ") shaft_disp=" << shaft_disp
                       << " outside safe range ["
-                      << JOINT_RAW_MIN[gi] << ", " << JOINT_RAW_MAX[gi]
+                      << JOINT_SHAFT_MIN[gi] << ", " << JOINT_SHAFT_MAX[gi]
                       << "] — EMERGENCY STOP\n";
             ok = false;
             // Continue loop to report all violated joints before stopping
         }
 
         // --- Convert to MPC joint space ---
-        double offset  = cfg.joint_offsets[gi];
         bool is_knee   = (mpc_idx % 3 == 2);
         if (is_knee) {
             q_mpc[mpc_idx]  = (ms.position - offset) / cfg.knee_gear_ratio;
@@ -258,15 +265,14 @@ static void send_motor_commands(const std::shared_ptr<RobstrideController>& rs,
         double gear2 = gear * gear;
 
         // Convert joint space → motor shaft space
-        double pos_raw = q_des[mpc_idx] * gear + offset;
+        // Clamp shaft displacement (= joint * gear) before adding offset
+        double shaft_cmd = math_utils::clamp(q_des[mpc_idx] * gear,
+                                              (double)JOINT_SHAFT_MIN[motor_global_idx],
+                                              (double)JOINT_SHAFT_MAX[motor_global_idx]);
+        double pos_raw = shaft_cmd + offset;
         double kp_raw  = kp_vec[mpc_idx] / gear2;
         double kd_raw  = kd_vec[mpc_idx] / gear2;
         double tau_raw = tau_ff[mpc_idx] / gear;
-
-        // Clamp position to per-joint physical limits
-        pos_raw = math_utils::clamp(pos_raw,
-                                     (double)JOINT_RAW_MIN[motor_global_idx],
-                                     (double)JOINT_RAW_MAX[motor_global_idx]);
 
         // Clamp torque feedforward to hardware limit
         tau_raw = math_utils::clamp(tau_raw,
@@ -714,13 +720,14 @@ int main(int argc, char* argv[]) {
 
                     // Anti-windup: clamp q_des_swing to per-joint MPC-space limits
                     // so the integrator doesn't drift beyond the physical range.
-                    // MPC-space limit = (raw_limit - offset) / gear
+                    // MPC-space limit = shaft_disp_limit / gear
+                    // (JOINT_SHAFT_MIN/MAX are already relative to stand pose = offset)
                     for (int j = 0; j < 3; ++j) {
                         int gi_j  = MPC_TO_MOTOR_IDX[idx + j];
                         bool knee = (j == 2);
                         double gr = knee ? cfg.knee_gear_ratio : 1.0;
-                        double lo = ((double)JOINT_RAW_MIN[gi_j] - cfg.joint_offsets[gi_j]) / gr;
-                        double hi = ((double)JOINT_RAW_MAX[gi_j] - cfg.joint_offsets[gi_j]) / gr;
+                        double lo = (double)JOINT_SHAFT_MIN[gi_j] / gr;
+                        double hi = (double)JOINT_SHAFT_MAX[gi_j] / gr;
                         q_des_swing[idx + j] = math_utils::clamp(q_des_swing[idx + j], lo, hi);
                     }
 
