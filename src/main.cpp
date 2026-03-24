@@ -463,6 +463,10 @@ int main(int argc, char* argv[]) {
     Eigen::Vector3d v_cmd_body{0.,0.,0.};
     double yaw_rate_cmd = 0.0;
 
+    // Gait activation: stays in MPC standing mode until gamepad commands velocity
+    bool gait_active = false;
+    constexpr double GAIT_ACTIVATE_THRESHOLD = 0.03;  // m/s or rad/s
+
     // ===== Elevate PD thread priority =====
     {
         struct sched_param param;
@@ -571,90 +575,136 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // ===== 7. Gait update (500Hz) =====
-        double yaw = state.rpy[2];
-        Eigen::Vector3d v_cmd_world{
-            v_cmd_body[0]*std::cos(yaw) - v_cmd_body[1]*std::sin(yaw),
-            v_cmd_body[0]*std::sin(yaw) + v_cmd_body[1]*std::cos(yaw),
-            0.0
-        };
-
-        GaitOutput gait_out = gait.update(dt, state, v_cmd_world, foot_target_cache);
-
-        // Share gait phase with MPC thread so it can sync its own GaitGenerator
-        {
-            std::lock_guard<std::mutex> lk(shared_mpc.mtx);
-            shared_mpc.gait_phase = gait.phase();
+        // ===== 7. Gait activation check =====
+        // Gait stays inactive until gamepad commands non-zero velocity.
+        // This gives the operator time to verify MPC standing before walking.
+        if (!gait_active) {
+            double v_norm = v_cmd_body.head<2>().norm();
+            if (v_norm > GAIT_ACTIVATE_THRESHOLD ||
+                std::abs(yaw_rate_cmd) > GAIT_ACTIVATE_THRESHOLD) {
+                gait_active = true;
+                std::cout << "[Control] Gait ACTIVATED (gamepad input detected)\n";
+            }
         }
 
-        // ===== 8. WBC (500Hz) =====
-        WBCController::Input wbc_in;
-        wbc_in.f_mpc     = mpc_cache.f_stance;
-        wbc_in.foot_vel_w = state.foot_vel_world;
-        wbc_in.dq        = dq_mpc;
-        for (int i = 0; i < 4; ++i) wbc_in.contact[i] = gait_out.contact[i];
-        wbc_in.state = &state;
-
-        Eigen::Matrix<double,12,1> tau_wbc = wbc.compute(wbc_in);
-
-        // ===== 9. Compute motor targets (500Hz) =====
-        // PD position tracking is handled by the motor's internal MIT controller (~10kHz).
-        // We only compute: q_des (target angle), kp/kd (per-joint gains), tau_ff (WBC feedforward).
-        // Motor executes: τ = kp*(q_des - q) + kd*(0 - dq) + tau_ff
+        // ===== 8. Gait + WBC + Motor targets (500Hz) =====
         Eigen::Matrix<double,12,1> tau_ff = Eigen::Matrix<double,12,1>::Zero();
         Eigen::Matrix<double,12,1> q_des  = Eigen::Matrix<double,12,1>::Zero();
         Eigen::Matrix<double,12,1> kp_vec = Eigen::Matrix<double,12,1>::Zero();
         Eigen::Matrix<double,12,1> kd_vec = Eigen::Matrix<double,12,1>::Zero();
 
-        for (int i = 0; i < 4; ++i) {
-            int idx = i * 3;
-            if (gait_out.contact[i]) {
-                // Stance: hold stand pose + WBC feedforward torque (J^T * f_mpc)
+        if (!gait_active) {
+            // ---- MPC Standing mode ----
+            // All 4 legs in contact, MPC provides GRF, no gait.
+            // Operator can observe MPC GRF and verify correctness.
+            std::array<bool,4> all_contact{true, true, true, true};
+
+            WBCController::Input wbc_in;
+            wbc_in.f_mpc     = mpc_cache.f_stance;
+            wbc_in.foot_vel_w = state.foot_vel_world;
+            wbc_in.dq        = dq_mpc;
+            wbc_in.contact   = all_contact;
+            wbc_in.state     = &state;
+
+            Eigen::Matrix<double,12,1> tau_wbc = wbc.compute(wbc_in);
+
+            for (int i = 0; i < 4; ++i) {
+                int idx = i * 3;
                 q_des.segment<3>(idx)  = cfg.stand_joint_angles.segment<3>(idx);
                 kp_vec.segment<3>(idx).setConstant(cfg.kp_stance);
                 kd_vec.segment<3>(idx).setConstant(cfg.kd_stance);
                 tau_ff.segment<3>(idx) = tau_wbc.segment<3>(idx);
-            } else {
-                // Swing: IK-based trajectory tracking, no feedforward torque
-                if (prev_contact[i]) {
-                    q_des_swing.segment<3>(idx) = q_mpc.segment<3>(idx);
-                }
-
-                // Cartesian foot velocity to joint space via Jacobian inverse
-                Eigen::Vector3d p_err = gait_out.foot_target_pos.row(i).transpose()
-                                       - state.foot_pos_world.row(i).transpose();
-                Eigen::Vector3d v_cart_cmd = gait_out.foot_target_vel.row(i).transpose()
-                                            + 20.0 * p_err;
-
-                Eigen::Matrix3d J_body  = kin.jacobian(i, q_mpc.segment<3>(idx));
-                Eigen::Matrix3d J_world = state.rot_mat * J_body;
-                Eigen::Matrix3d JJT     = J_world * J_world.transpose()
-                                         + 1e-3 * Eigen::Matrix3d::Identity();
-                Eigen::Matrix3d J_inv   = J_world.transpose() * JJT.inverse();
-                Eigen::Vector3d dq_des  = J_inv * v_cart_cmd;
-
-                q_des_swing.segment<3>(idx) += dq_des * dt;
-
-                q_des.segment<3>(idx)  = q_des_swing.segment<3>(idx);
-                kp_vec.segment<3>(idx).setConstant(cfg.kp_swing);
-                kd_vec.segment<3>(idx).setConstant(cfg.kd_swing);
-                // tau_ff remains 0 for swing legs
             }
-        }
 
-        for (int i = 0; i < 4; ++i) prev_contact[i] = gait_out.contact[i];
+            // Keep gait phase frozen at 0, share with MPC thread
+            {
+                std::lock_guard<std::mutex> lk(shared_mpc.mtx);
+                shared_mpc.gait_phase = 0.0;
+            }
+        } else {
+            // ---- Walking mode ----
+            double yaw = state.rpy[2];
+            Eigen::Vector3d v_cmd_world{
+                v_cmd_body[0]*std::cos(yaw) - v_cmd_body[1]*std::sin(yaw),
+                v_cmd_body[0]*std::sin(yaw) + v_cmd_body[1]*std::cos(yaw),
+                0.0
+            };
+
+            GaitOutput gait_out = gait.update(dt, state, v_cmd_world, foot_target_cache);
+
+            // Share gait phase with MPC thread
+            {
+                std::lock_guard<std::mutex> lk(shared_mpc.mtx);
+                shared_mpc.gait_phase = gait.phase();
+            }
+
+            // WBC
+            WBCController::Input wbc_in;
+            wbc_in.f_mpc     = mpc_cache.f_stance;
+            wbc_in.foot_vel_w = state.foot_vel_world;
+            wbc_in.dq        = dq_mpc;
+            for (int i = 0; i < 4; ++i) wbc_in.contact[i] = gait_out.contact[i];
+            wbc_in.state = &state;
+
+            Eigen::Matrix<double,12,1> tau_wbc = wbc.compute(wbc_in);
+
+            // Motor targets: stance legs get WBC tau_ff, swing legs get IK tracking
+            for (int i = 0; i < 4; ++i) {
+                int idx = i * 3;
+                if (gait_out.contact[i]) {
+                    q_des.segment<3>(idx)  = cfg.stand_joint_angles.segment<3>(idx);
+                    kp_vec.segment<3>(idx).setConstant(cfg.kp_stance);
+                    kd_vec.segment<3>(idx).setConstant(cfg.kd_stance);
+                    tau_ff.segment<3>(idx) = tau_wbc.segment<3>(idx);
+                } else {
+                    // Swing: IK-based trajectory tracking
+                    if (prev_contact[i]) {
+                        q_des_swing.segment<3>(idx) = q_mpc.segment<3>(idx);
+                    }
+
+                    Eigen::Vector3d p_err = gait_out.foot_target_pos.row(i).transpose()
+                                           - state.foot_pos_world.row(i).transpose();
+                    Eigen::Vector3d v_cart_cmd = gait_out.foot_target_vel.row(i).transpose()
+                                                + 20.0 * p_err;
+
+                    Eigen::Matrix3d J_body  = kin.jacobian(i, q_mpc.segment<3>(idx));
+                    Eigen::Matrix3d J_world = state.rot_mat * J_body;
+                    Eigen::Matrix3d JJT     = J_world * J_world.transpose()
+                                             + 1e-3 * Eigen::Matrix3d::Identity();
+                    Eigen::Matrix3d J_inv   = J_world.transpose() * JJT.inverse();
+                    Eigen::Vector3d dq_des  = J_inv * v_cart_cmd;
+
+                    q_des_swing.segment<3>(idx) += dq_des * dt;
+
+                    q_des.segment<3>(idx)  = q_des_swing.segment<3>(idx);
+                    kp_vec.segment<3>(idx).setConstant(cfg.kp_swing);
+                    kd_vec.segment<3>(idx).setConstant(cfg.kd_swing);
+                }
+            }
+
+            for (int i = 0; i < 4; ++i) prev_contact[i] = gait_out.contact[i];
+        }
 
         // Safety: NaN check on WBC output
         if (tau_ff.hasNaN()) tau_ff.setZero();
 
-        // ===== 10. Send motor commands =====
+        // ===== 9. Send motor commands =====
         send_motor_commands(rs, motor_indices, cfg, q_des, tau_ff, kp_vec, kd_vec);
 
-        // ===== 11. Debug print (every 0.5s) =====
+        // ===== 10. Debug print (every 0.5s) =====
         if (std::chrono::duration<double>(now - last_print).count() >= 0.5) {
-            std::printf("[%6.1fs] vx=%.2f yaw=%.2f | mpc_ms=%.1f | z=%.3f\n",
-                        startup_time, v_cmd_body[0], yaw_rate_cmd,
+            std::printf("[%6.1fs] %s | vx=%.2f yaw=%.2f | mpc_ms=%.1f | z=%.3f",
+                        startup_time,
+                        gait_active ? "WALK" : "STAND",
+                        v_cmd_body[0], yaw_rate_cmd,
                         mpc_cache.solve_time_ms, state.pos[2]);
+            if (!gait_active) {
+                // Print MPC GRF for operator verification
+                std::printf(" | fz=[%.1f,%.1f,%.1f,%.1f]N",
+                            mpc_cache.f_stance[2], mpc_cache.f_stance[5],
+                            mpc_cache.f_stance[8], mpc_cache.f_stance[11]);
+            }
+            std::printf("\n");
             last_print = now;
         }
 

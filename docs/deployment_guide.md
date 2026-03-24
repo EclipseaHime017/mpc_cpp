@@ -101,17 +101,9 @@ find /usr/local/lib -name "libcasadi*"   # 应能找到 libcasadi.so
 
 ## 二、获取源码
 
-本项目分为两个代码仓库，都需要在 Jetson 上就位：
+项目已完全自包含，硬件驱动代码位于 `driver/` 目录，**不再依赖 `pure_cpp/`**。
 
-```
-~/
-├── mpc_cpp/     ← MPC 控制器（本仓库，GitHub 获取）
-└── pure_cpp/    ← 硬件通信层（电机/IMU/手柄驱动，手动传输）
-```
-
-> ⚠️ `mpc_cpp` 的 `CMakeLists.txt` 在编译时会引用 `../pure_cpp/Main/` 下的源文件，两个目录必须**同级**存在，缺一不可。
-
-### 2.1 获取 mpc_cpp（GitHub）
+### 2.1 获取源码（GitHub）
 
 ```bash
 # [Jetson]
@@ -119,29 +111,7 @@ cd ~
 git clone https://github.com/EclipseaHime017/mpc_cpp.git
 ```
 
-### 2.2 获取 pure_cpp（从开发机传输）
-
-`pure_cpp` 包含硬件驱动私有代码，不在 GitHub 上，通过 rsync/scp 传输：
-
-```bash
-# [开发机] 执行，替换 <Jetson的IP>
-rsync -av --exclude='build*' \
-    ~/eclipseaws/BFYP/pure_cpp/ \
-    ares@<Jetson的IP>:~/pure_cpp/
-```
-
-> ⚠️ **同步后需手动修改** `~/pure_cpp/Main/include/observations.hpp`，在 `IMUComponent` 的 public 区块添加以下三个访问器，否则 `mpc_robot_control` 编译会报错：
->
-> ```cpp
-> // 在 void Update() override; 后面加入：
-> float const* get_quaternion() const { return quaternion; }  // [w,x,y,z]
-> float const* get_gyro()       const { return gyro; }        // [x,y,z] rad/s
-> float const* get_acc()        const { return acc; }         // [x,y,z] m/s^2
-> ```
->
-> 此修改对 `pure_cpp` 原有功能**无任何影响**（只读接口，不改变任何行为）。
-
-### 2.3 编译
+### 2.2 编译
 
 ```bash
 # [Jetson]
@@ -361,20 +331,31 @@ joint_offsets:
 ```
 sudo ./build/mpc_robot_control config/robot_params.yaml
   │
-  ├─ 自动：电机 Enable + 30步插值到站立姿态（约3s）
+  ├─ Phase A (自动)：电机 Enable + 30步插值到站立姿态（约3s）
   │
   ├─ 打印：Press ENTER to start MPC control loop...
   │         此处 Ctrl+C 可安全中断（电机归零后断电）
   │
   └─ 按 ENTER → 进入 500Hz 控制循环
-       ├─ 前 2s（calib_duration）：PD 保持站立 + IMU 标定
-       └─ 2s 后：MPC + 步态 + WBC 全部激活
+       │
+       ├─ Phase B (自动 2s)：PD 保持站立 + IMU 标定
+       │
+       ├─ Phase C (自动)：MPC 静态站立
+       │     四腿全接地，MPC 出 GRF，WBC 计算 tau_ff
+       │     终端显示 "STAND" + GRF 数值
+       │     此阶段可验证 MPC 输出是否正常
+       │
+       └─ Phase D (手柄触发)：推手柄 → 步态激活
+             终端显示 "WALK"
+             步态 + MPC + WBC 全部运行
 ```
 
-**Phase 之间的切换**：每个 Phase 需要**重新启动**程序。流程：
-1. `Ctrl+C` 停止当前程序（电机归零断电）
-2. 编辑 `config/robot_params.yaml`
-3. 重新运行 `sudo ./build/mpc_robot_control config/robot_params.yaml`
+**关键设计**：Phase C → Phase D 的切换由**手柄速度指令**触发（`|v_cmd| > 0.03 m/s` 或 `|yaw_rate| > 0.03 rad/s`），而非自动。操作员可以在 Phase C 充分验证 MPC 输出后再推手柄开始行走。
+
+**Phase 之间的切换**：
+- Phase A → B → C：程序自动推进，无需干预
+- Phase C → D：**推手柄**触发，一旦激活不可回退
+- 修改 yaml 参数需 `Ctrl+C` 后重新启动程序
 
 ---
 
@@ -386,7 +367,6 @@ sudo ./build/mpc_robot_control config/robot_params.yaml
 ```yaml
 mit_kp: 30.0
 mit_kd: 1.5
-torque_limit: 15.0   # 低于电机上限 17Nm，留安全余量
 target_z: 0.20
 ```
 
@@ -394,7 +374,7 @@ target_z: 0.20
 ```bash
 sudo ./build/mpc_robot_control config/robot_params.yaml
 # 等待插值完成后按 ENTER
-# 观察 2s 标定阶段 + 控制循环启动
+# 观察 2s 标定阶段 + MPC 静态站立
 # Ctrl+C 退出
 ```
 
@@ -405,81 +385,93 @@ sudo ./build/mpc_robot_control config/robot_params.yaml
 
 ---
 
-### Phase B：地面静止站立
+### Phase B：地面静止站立（IMU 标定）
 
-**物理准备**：机器人放到地面，**手扶机身**。
+> 此阶段在按下 ENTER 后**自动**执行约 2 秒（`calib_duration`），无需操作。
+
+**物理准备**：机器人放到地面，**手扶机身**，保持静止。
 
 **修改 yaml**（相对 Phase A 提高刚度）：
 ```yaml
 mit_kp: 40.0
 mit_kd: 0.5
-torque_limit: 15.0   # 保持不变；mit_torque_limit: 17.0 是电机硬件上限，不要修改
 ```
 
-**运行**：同 Phase A，等待插值后按 ENTER，此时 MPC 已在后台运行但机器人静止。
-
 **检查项**：
+- [ ] 终端打印 `[Calib] Nominal foot offsets calibrated.`
 - [ ] 站立高度 ≈ `target_z`（卷尺验证）
-- [ ] 四腿均匀受力（体重秤，误差 < 20%）
-- [ ] 轻推后能恢复
-- [ ] 静止 30s，电机温度 < 60°C
 
 ---
 
-### Phase C：MPC GRF 验证
+### Phase C：MPC 静态站立
 
-**无需重启**，在 Phase B 按下 ENTER 后 MPC 已自动运行。观察终端输出：
+> Phase B 结束后**自动**进入 Phase C。四腿全接地，MPC 计算 GRF，WBC 计算前馈力矩。
+> **此阶段不会启动步态**，机器人保持静止，终端显示 `STAND`。
 
+终端输出示例：
 ```
-[MPC] fz=[29.5, 29.3, 29.4, 29.5]N   sum=117.7N   ✓
-[MPC] solve_time=2.4ms                              ✓
+[  3.0s] STAND | vx=0.00 yaw=0.00 | mpc_ms=2.4 | z=0.201 | fz=[29.5,29.3,29.4,29.5]N
 ```
-
-> Phase B 和 Phase C 是**同一次运行**的不同观测维度：B 看物理姿态，C 看终端数值。
 
 **检查项**：
-- [ ] 四腿法向力之和 ≈ `mass × 9.81 = 117.7N`（允许 ±15%）
-- [ ] `solve_time` < 5ms 且稳定
+- [ ] 四腿法向力之和 ≈ `mass * 9.81 = 117.7N`（允许 ±15%）
+- [ ] `mpc_ms` < 5ms 且稳定（无突变）
+- [ ] 四腿受力均匀（误差 < 20%）
+- [ ] 轻推后能恢复（MPC 提供反力）
+- [ ] 静止 30s，电机温度 < 60C
+
+> **此处可以安全地停留任意长时间**，等到所有指标正常后再推手柄进入 Phase D。
 
 ---
 
 ### Phase D：原地踏步
 
-**修改 yaml**（相对 Phase B/C）：
+> **由手柄触发**：在 Phase C 稳定后，轻推手柄摇杆。终端打印 `[Control] Gait ACTIVATED` 并切换为 `WALK` 模式。
+
+**修改 yaml**（首次踏步用保守参数）：
 ```yaml
-gait_period: 0.5
-step_height: 0.04
-ipopt_max_iter: 0    # 先关 NMPC，只用 ConvexMPC
+gait_period: 0.5       # 较慢步态
+step_height: 0.04      # 较低抬腿
 ```
 
-**运行**：启动后按 ENTER，手柄**零输入**，机器人应在原地 trot。
+**操作**：
+1. 启动程序 → Phase A/B/C 自动完成
+2. 确认 Phase C 的 MPC GRF 正常
+3. **轻推手柄**（约 0.1 m/s），机器人开始 trot
+4. 松开手柄，机器人继续原地踏步（v_cmd=0 但步态已激活）
 
 **检查项**：
 - [ ] 摆腿轨迹平滑，无碰地或突变
 - [ ] 步态周期与 `gait_period` 吻合（秒表验证）
-- [ ] 站立腿 GRF 连续（终端无突变打印）
+- [ ] 站立腿 GRF 连续（终端无突变）
 
 ---
 
 ### Phase E：慢速直行
 
-**修改 yaml**：
+**修改 yaml**（在 Phase D 稳定后调整）：
 ```yaml
 gait_period: 0.4
 step_height: 0.06
 ```
 
+**操作**：推手柄前进，观察直线行走。
+
+**检查项**：
 - [ ] 能稳定前进 > 3m
 - [ ] 直线偏差 < 20cm/m
+
+---
 
 ### Phase F：完整功能
 
 ```yaml
 gait_period: 0.35
 step_height: 0.07
-ipopt_max_iter: 30     # 开启 NMPC
-ipopt_tol: 0.01
 ```
+
+> 当前使用 **ConvexMPC + Raibert 启发式落足点**，NMPC 暂未启用（Jetson 上求解时间 ~120ms 超出 30Hz 预算）。
+> 未来若需启用 NMPC，需在 MPC 线程中恢复 `NMPCFootstepPlanner` 调用并优化求解速度。
 
 手柄控制：
 
@@ -489,8 +481,9 @@ ipopt_tol: 0.01
 | 左摇杆左/右（轴0） | 侧移，最大 ±0.5 m/s |
 | 右摇杆左/右（轴3） | 偏航，最大 ±0.5 rad/s |
 
+**检查项**：
 - [ ] 转弯、侧移稳定
-- [ ] NMPC 收敛率 > 90%
+- [ ] ConvexMPC solve_time < 5ms
 - [ ] 连续运行 > 5min 无异常
 
 ---
@@ -550,8 +543,7 @@ isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3
 | 模块 | 目标 | 报警阈值 |
 |------|------|---------|
 | PD 循环（500Hz） | < 2ms | > 3ms |
-| ConvexMPC | < 5ms | > 10ms |
-| NMPC（warm-start） | < 35ms | > 60ms |
+| ConvexMPC (OSQP) | < 5ms | > 10ms |
 | 电机温度 | < 60°C | > 75°C 降力矩 |
 
 ---
@@ -561,27 +553,30 @@ isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3
 ```
 【部署前 — Jetson 上】
   □ test_mpc_solver 4/4 通过
-  □ pure_cpp/observations.hpp 已添加 get_quaternion/get_gyro/get_acc
   □ joint_offsets 已用实机编码器标定
   □ IMU 坐标系验证通过（静止 rpy ≈ [0, 0, yaw]）
   □ Ctrl+C 紧急停止已测试（电机平滑断电）
-  □ torque_limit 从低值（10Nm）开始
+  □ mit_torque_limit = 17.0（不可修改，电机硬件上限）
   □ 备有物理断电开关
+  □ 手柄已连接（/dev/input/js0）
 
 【Phase A：悬空站立】
   □ 12 个关节方向和顺序验证通过
   □ 站立姿态保持 > 30s 无抖动
 
-【Phase B：地面静止】
+【Phase B：IMU 标定】
+  □ 终端打印 "Nominal foot offsets calibrated."
+
+【Phase C：MPC 静态站立（手柄触发前）】
+  □ 终端显示 STAND 模式
+  □ fz_total ≈ mass * 9.81（误差 < 15%）
+  □ solve_time < 5ms 稳定
   □ 四腿受力均匀（误差 < 20%）
   □ 高度与 target_z 吻合（误差 < 3cm）
   □ 轻推后能恢复
 
-【Phase C：MPC 静止验证】
-  □ fz_total ≈ mass × 9.81（误差 < 15%）
-  □ solve_time < 5ms 稳定
-
-【Phase D：原地踏步】
+【Phase D：原地踏步（推手柄触发）】
+  □ 终端显示 "Gait ACTIVATED" 并切换为 WALK 模式
   □ 摆腿平滑，连续 30 步以上无跌倒
 
 【Phase E：慢速直行】
@@ -589,6 +584,7 @@ isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3
 
 【Phase F：完整功能】
   □ 各方向稳定运动
+  □ ConvexMPC solve_time < 5ms
   □ 全速行走 > 5min，电机温度正常
 ```
 
@@ -599,14 +595,13 @@ isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3
 | 现象 | 最可能原因 | 排查方法 |
 |------|-----------|---------|
 | `cmake` 报 `casadi::casadi not found` | CasADi 未导出 CMake target | `find /usr/local/lib -name "libcasadi*"` 确认安装，`rm -rf build` 后重新 cmake |
-| `undefined reference to get_quaternion` | `observations.hpp` 未添加访问器 | 按第 2.2 节说明添加三行后重新编译 |
 | `undefined reference to NMPCFootstepPlanner` | `nmpc_footstep.cpp` 未加入 sources | 已修复，`git pull` 后重新编译 |
 | 电机不动 | CAN ID 不匹配 | `candump candle0` 对比 `motor_ids` |
 | 站立时腿方向反 | 关节符号错误 | 单关节测试，逐一对照验证表 |
 | 站立时身体倾斜 | `joint_offsets` 不准 | 重新标定零偏 |
 | IMU 重力方向错 | `R_imu2body` 错误 | 静止时打印 rpy，调整旋转矩阵 |
 | MPC 法向力为负 | FK 足端位置误差大 | 检查 `foot_pos_world`，验证运动学 |
-| NMPC 每次 > 50ms | IPOPT 收敛慢 | 减小 `mpc_horizon` 到 6，`ipopt_tol` 放宽到 0.05 |
+| 步态不启动 | 手柄未连接或未推杆 | 确认 `/dev/input/js0` 存在，推手柄超过阈值 |
 | PD 循环 jitter 大 | 未开实时优先级或 CPU 降频 | `chrt -f 90`，设置 performance governor |
 | 行走持续偏转 | 陀螺仪零偏未标定 | 延长 `calib_duration`，静止后再启动 |
 | 摆腿蹭地 | `step_height` 过小或 FK 误差 | 增大 `step_height`，检查膝关节 FK |
