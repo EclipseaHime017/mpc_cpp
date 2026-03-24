@@ -218,28 +218,25 @@ static void send_motor_commands(const std::shared_ptr<RobstrideController>& rs,
 // ============================================================
 struct SharedMPCData {
     MPCOutput output;
-    Eigen::Matrix<double, 4, 3> nmpc_foot_target;
+    Eigen::Matrix<double, 4, 3> foot_target;   // Raibert foot placement targets
+    // Written by PD thread, read by MPC thread
+    Eigen::Vector3d v_cmd_body{0., 0., 0.};
+    double yaw_rate_cmd{0.0};
+    double gait_phase{0.0};
     std::mutex mtx;
     bool initialized = false;
 };
 
-static void mpc_thread_fn(RobotConfig cfg,   // own copy so nominal_foot_offsets can be updated
+// MPC thread: ConvexMPC (OSQP) for GRF + Raibert heuristic for foot placement.
+// NMPC is intentionally excluded — it runs at ~120ms on Jetson which breaks 30Hz timing.
+static void mpc_thread_fn(RobotConfig cfg,
                            SharedMPCData& shared,
                            std::atomic<bool>& running,
                            const RobotState& state_ref,
                            std::mutex& state_mtx)
 {
-    NMPCFootstepPlanner nmpc(cfg);
-    GaitGenerator gait(cfg);
-
-    // Velocity command (protected by shared data mutex)
-    Eigen::Vector3d v_cmd_body{0., 0., 0.};
-    Eigen::Vector3d v_cmd_target{0., 0., 0.};
-    double yaw_rate_cmd = 0.0;
-    double yaw_rate_target = 0.0;
-
-    Eigen::Matrix<double,4,3> nmpc_target_cache = Eigen::Matrix<double,4,3>::Zero();
-    bool nmpc_init = false;
+    MPCController mpc(cfg);
+    GaitGenerator gait_mpc(cfg);  // separate instance; phase synced from PD thread
 
     auto period = std::chrono::microseconds(static_cast<int>(1e6 / cfg.mpc_freq));
     auto next_wake = std::chrono::steady_clock::now();
@@ -247,64 +244,74 @@ static void mpc_thread_fn(RobotConfig cfg,   // own copy so nominal_foot_offsets
     while (running) {
         next_wake += period;
 
-        // Copy current state
+        // Read robot state
         RobotState state;
         {
             std::lock_guard<std::mutex> lk(state_mtx);
             state = state_ref;
         }
 
-        // Smooth velocity command
-        v_cmd_body   = (1.0 - cfg.vcmd_alpha) * v_cmd_body   + cfg.vcmd_alpha * v_cmd_target;
-        yaw_rate_cmd = (1.0 - cfg.vcmd_alpha) * yaw_rate_cmd + cfg.vcmd_alpha * yaw_rate_target;
+        // Read velocity command and gait phase written by PD thread
+        Eigen::Vector3d v_cmd_body;
+        double yaw_rate_cmd;
+        {
+            std::lock_guard<std::mutex> lk(shared.mtx);
+            v_cmd_body   = shared.v_cmd_body;
+            yaw_rate_cmd = shared.yaw_rate_cmd;
+            gait_mpc.set_phase(shared.gait_phase);
+        }
 
-        // Predict contact sequence and build reference trajectory
-        Eigen::MatrixXd contact_seq = gait.predict_contact_sequence(cfg.mpc_horizon);
-        Eigen::MatrixXd X_ref = gait.get_mpc_reference(state, cfg.target_z, v_cmd_body, yaw_rate_cmd);
+        // Predict contact sequence and build MPC reference
+        Eigen::MatrixXd contact_seq = gait_mpc.predict_contact_sequence(cfg.mpc_horizon);
+        Eigen::MatrixXd X_ref = gait_mpc.get_mpc_reference(
+            state, cfg.target_z, v_cmd_body, yaw_rate_cmd);
 
-        // Compute world-frame velocity command
+        // Current contact state (first column of prediction)
+        std::array<bool, 4> contact_now;
+        for (int i = 0; i < 4; ++i) contact_now[i] = (contact_seq(i, 0) > 0.5);
+
+        // Solve ConvexMPC for GRF
+        Eigen::Matrix<double, 12, 1> f_grf =
+            mpc.solve(state, state.foot_pos_world, contact_now, X_ref);
+
+        // Raibert heuristic: place swing foot at hip + v_cmd * T_stance/2
+        double T_stance = cfg.duty_factor * cfg.gait_period;
         double yaw = state.rpy[2];
-        Eigen::Vector3d v_cmd_world{
+        Eigen::Vector3d v_world{
             v_cmd_body[0]*std::cos(yaw) - v_cmd_body[1]*std::sin(yaw),
             v_cmd_body[0]*std::sin(yaw) + v_cmd_body[1]*std::cos(yaw),
             0.0
         };
 
-        if (!nmpc_init) {
-            nmpc_target_cache = state.foot_pos_world;
-            nmpc_init = true;
+        Eigen::Matrix<double, 4, 3> foot_targets = state.foot_pos_world;  // stance: hold current
+        for (int i = 0; i < 4; ++i) {
+            if (!contact_now[i]) {
+                // Hip position in world frame
+                foot_targets(i, 0) = state.pos[0]
+                    + cfg.hip_offsets(i, 0) * std::cos(yaw)
+                    - cfg.hip_offsets(i, 1) * std::sin(yaw)
+                    + v_world[0] * T_stance * 0.5;
+                foot_targets(i, 1) = state.pos[1]
+                    + cfg.hip_offsets(i, 0) * std::sin(yaw)
+                    + cfg.hip_offsets(i, 1) * std::cos(yaw)
+                    + v_world[1] * T_stance * 0.5;
+                foot_targets(i, 2) = 0.0;
+            }
         }
 
-        // Build foot positions matrix
-        Eigen::Matrix<double,4,3> foot_pos_w = state.foot_pos_world;
-
-        // Solve NMPC
-        auto nmpc_result = nmpc.solve(state, contact_seq, foot_pos_w, X_ref,
-                                       cfg.hip_offsets, cfg.nominal_foot_offsets);
-
-        // Update shared output
+        // Publish to PD thread
         {
             std::lock_guard<std::mutex> lk(shared.mtx);
-            shared.output.f_stance = nmpc_result.f_first_step.reshaped(4, 3);
-            // EMA filter on foot targets
-            for (int i = 0; i < 4; ++i) {
-                double raw_x = nmpc_result.foot_placement(i, 0);
-                double raw_y = nmpc_result.foot_placement(i, 1);
-                nmpc_target_cache(i, 0) = (1.0 - cfg.nmpc_alpha) * nmpc_target_cache(i, 0)
-                                         + cfg.nmpc_alpha * raw_x;
-                nmpc_target_cache(i, 1) = (1.0 - cfg.nmpc_alpha) * nmpc_target_cache(i, 1)
-                                         + cfg.nmpc_alpha * raw_y;
-                nmpc_target_cache(i, 2) = 0.0;
-                shared.nmpc_foot_target.row(i) = nmpc_target_cache.row(i);
-            }
-            shared.output.solve_time_ms = nmpc_result.solve_time_ms;
-            shared.output.valid = true;
-            shared.initialized = true;
+            for (int i = 0; i < 4; ++i)
+                shared.output.f_stance.row(i) = f_grf.segment<3>(i * 3).transpose();
+            shared.foot_target         = foot_targets;
+            shared.output.solve_time_ms = mpc.last_solve_ms();
+            shared.output.valid         = true;
+            shared.initialized          = true;
         }
 
-        if (nmpc_result.solve_time_ms > 30.0) {
-            std::cerr << "[MPC] Slow solve: " << nmpc_result.solve_time_ms << " ms\n";
-        }
+        if (mpc.last_solve_ms() > 10.0)
+            std::cerr << "[MPC] Slow solve: " << mpc.last_solve_ms() << " ms\n";
 
         std::this_thread::sleep_until(next_wake);
     }
@@ -408,7 +415,7 @@ int main(int argc, char* argv[]) {
 
     // Cached MPC output (updated every ~33ms)
     MPCOutput mpc_cache;
-    Eigen::Matrix<double,4,3> nmpc_foot_cache = Eigen::Matrix<double,4,3>::Zero();
+    Eigen::Matrix<double,4,3> foot_target_cache = Eigen::Matrix<double,4,3>::Zero();
 
     // Swing tracking
     Eigen::Matrix<double,12,1> q_des_swing = Eigen::Matrix<double,12,1>::Zero();
@@ -463,6 +470,12 @@ int main(int argc, char* argv[]) {
             v_cmd_body[1] =  0.0;
             yaw_rate_cmd  = -gamepad->GetAxis(3) * 0.5;  // yaw
         }
+        // Share velocity command with MPC thread (written every 2ms, read every 33ms)
+        {
+            std::lock_guard<std::mutex> lk(shared_mpc.mtx);
+            shared_mpc.v_cmd_body   = v_cmd_body;
+            shared_mpc.yaw_rate_cmd = yaw_rate_cmd;
+        }
 
         // ===== 5. Calibration phase (first calib_duration seconds) =====
         if (startup_time < cfg.calib_duration) {
@@ -497,13 +510,12 @@ int main(int argc, char* argv[]) {
         {
             std::lock_guard<std::mutex> lk(shared_mpc.mtx);
             if (shared_mpc.initialized) {
-                mpc_cache      = shared_mpc.output;
-                nmpc_foot_cache = shared_mpc.nmpc_foot_target;
+                mpc_cache        = shared_mpc.output;
+                foot_target_cache = shared_mpc.foot_target;
             }
         }
 
         // ===== 7. Gait update (500Hz) =====
-        // Convert body velocity to world frame for Raibert heuristic
         double yaw = state.rpy[2];
         Eigen::Vector3d v_cmd_world{
             v_cmd_body[0]*std::cos(yaw) - v_cmd_body[1]*std::sin(yaw),
@@ -511,7 +523,13 @@ int main(int argc, char* argv[]) {
             0.0
         };
 
-        GaitOutput gait_out = gait.update(dt, state, v_cmd_world, nmpc_foot_cache);
+        GaitOutput gait_out = gait.update(dt, state, v_cmd_world, foot_target_cache);
+
+        // Share gait phase with MPC thread so it can sync its own GaitGenerator
+        {
+            std::lock_guard<std::mutex> lk(shared_mpc.mtx);
+            shared_mpc.gait_phase = gait.phase();
+        }
 
         // ===== 8. WBC (500Hz) =====
         WBCController::Input wbc_in;
