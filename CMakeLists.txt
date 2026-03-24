@@ -211,6 +211,23 @@ target_link_libraries(test_single_joint
     ${LIBUSB_LIBRARIES}
 )
 
+# Joystick connectivity test (no hardware/sudo required)
+add_executable(test_joystick
+    src/common/robot_config.cpp
+    ${DRIVER_DIR}/src/observations.cpp
+    tests/test_joystick.cpp
+)
+target_include_directories(test_joystick PUBLIC
+    include
+    ${DRIVER_DIR}/include
+    ${EIGEN3_INCLUDE_DIR}
+)
+target_link_libraries(test_joystick
+    Threads::Threads
+    Eigen3::Eigen
+    yaml-cpp
+)
+
 # ============================================================
 # Build summary
 # ============================================================
