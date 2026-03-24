@@ -298,6 +298,7 @@ struct SharedMPCData {
     Eigen::Vector3d v_cmd_body{0., 0., 0.};
     double yaw_rate_cmd{0.0};
     double gait_phase{0.0};
+    bool gait_active{false};   // false = STAND (all-contact MPC), true = WALK (trot contact)
     std::chrono::steady_clock::time_point last_update{std::chrono::steady_clock::now()};
     std::mutex mtx;
     bool initialized = false;
@@ -327,24 +328,31 @@ static void mpc_thread_fn(RobotConfig cfg,
             state = state_ref;
         }
 
-        // Read velocity command and gait phase written by PD thread
+        // Read velocity command, gait phase, and active flag written by PD thread
         Eigen::Vector3d v_cmd_body;
         double yaw_rate_cmd;
+        bool is_gait_active;
         {
             std::lock_guard<std::mutex> lk(shared.mtx);
-            v_cmd_body   = shared.v_cmd_body;
-            yaw_rate_cmd = shared.yaw_rate_cmd;
+            v_cmd_body     = shared.v_cmd_body;
+            yaw_rate_cmd   = shared.yaw_rate_cmd;
+            is_gait_active = shared.gait_active;
             gait_mpc.set_phase(shared.gait_phase);
         }
 
         // Predict contact sequence and build MPC reference
-        Eigen::MatrixXd contact_seq = gait_mpc.predict_contact_sequence(cfg.mpc_horizon);
         Eigen::MatrixXd X_ref = gait_mpc.get_mpc_reference(
             state, cfg.target_z, v_cmd_body, yaw_rate_cmd);
 
-        // Current contact state (first column of prediction)
+        // Contact: in STAND mode force all-four-contact so MPC distributes weight evenly.
+        // In WALK mode use the trot gait prediction.
         std::array<bool, 4> contact_now;
-        for (int i = 0; i < 4; ++i) contact_now[i] = (contact_seq(i, 0) > 0.5);
+        if (!is_gait_active) {
+            contact_now = {true, true, true, true};
+        } else {
+            Eigen::MatrixXd contact_seq = gait_mpc.predict_contact_sequence(cfg.mpc_horizon);
+            for (int i = 0; i < 4; ++i) contact_now[i] = (contact_seq(i, 0) > 0.5);
+        }
 
         // Solve ConvexMPC for GRF
         Eigen::Matrix<double, 12, 1> f_grf =
@@ -626,6 +634,8 @@ int main(int argc, char* argv[]) {
                 std::abs(yaw_rate_cmd) > GAIT_ACTIVATE_THRESHOLD) {
                 gait_active = true;
                 std::cout << "[Control] Gait ACTIVATED (gamepad input detected)\n";
+                std::lock_guard<std::mutex> lk(shared_mpc.mtx);
+                shared_mpc.gait_active = true;
             }
         }
 
