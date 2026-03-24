@@ -46,7 +46,7 @@ if(osqp-cpp_FOUND)
     message(STATUS "osqp-cpp found (Google wrapper)")
     set(OSQP_CPP_LIB osqp-cpp::osqp-cpp)
 else()
-    message(WARNING "osqp-cpp not found; using OsqpEigen instead")
+    message(STATUS "osqp-cpp not found; using OsqpEigen (expected on Jetson)")
     # Fallback: OsqpEigen (https://github.com/robotology/osqp-eigen)
     find_package(OsqpEigen REQUIRED
         HINTS /usr/local/lib/cmake/OsqpEigen
@@ -211,21 +211,29 @@ target_link_libraries(test_single_joint
     ${LIBUSB_LIBRARIES}
 )
 
-# Joystick connectivity test (no hardware/sudo required)
+# Joystick connectivity test (no motors/IMU needed, no sudo required)
+# observations.cpp references IMUComponent+JointComponent which pull in serial/WIT/
+# Robstride symbols at link time — include all driver sources like test_imu does.
 add_executable(test_joystick
     src/common/robot_config.cpp
+    ${DRIVER_DIR}/src/robstride.cpp
+    ${DRIVER_DIR}/src/can_interface.cpp
+    ${DRIVER_DIR}/src/serial.c
+    ${DRIVER_DIR}/src/wit_c_sdk.c
     ${DRIVER_DIR}/src/observations.cpp
     tests/test_joystick.cpp
 )
 target_include_directories(test_joystick PUBLIC
     include
     ${DRIVER_DIR}/include
+    ${LIBUSB_INCLUDE_DIRS}
     ${EIGEN3_INCLUDE_DIR}
 )
 target_link_libraries(test_joystick
     Threads::Threads
     Eigen3::Eigen
     yaml-cpp
+    ${LIBUSB_LIBRARIES}
 )
 
 # ============================================================
