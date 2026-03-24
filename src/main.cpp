@@ -48,26 +48,17 @@
 static std::atomic<bool> g_running{true};
 static void signal_handler(int) { g_running = false; }
 
-// Motor setup (matching pure_cpp/main.cpp)
-static const std::vector<char> CAN_IDS = {'0', '1', '2', '3'};
-// motor_ids: [LF_HipA, LR_HipA, RF_HipA, RR_HipA,
-//             LF_HipF, LR_HipF, RF_HipF, RR_HipF,
-//             LF_Knee, LR_Knee, RF_Knee, RR_Knee]
-static const std::vector<int> MOTOR_IDS = {1,5,9,13, 2,6,10,14, 3,7,11,15};
-
-// Joint ordering reindex:
-// pure_cpp motor_indices order: [LF_HipA, LR_HipA, RF_HipA, RR_HipA,
-//                                LF_HipF, LR_HipF, RF_HipF, RR_HipF,
-//                                LF_Knee, LR_Knee, RF_Knee, RR_Knee]
-// MPC control ordering:  [LF_HipA, LF_HipF, LF_Knee,
-//                         LR_HipA, LR_HipF, LR_Knee,
-//                         RF_HipA, RF_HipF, RF_Knee,
-//                         RR_HipA, RR_HipF, RR_Knee]
-// Mapping: MPC_idx -> motor_index[]
-// LF_HipA=0, LF_HipF=4, LF_Knee=8   -> MPC[0]=motor[0], MPC[1]=motor[4], MPC[2]=motor[8]
-// LR_HipA=1, LR_HipF=5, LR_Knee=9   -> MPC[3]=motor[1], MPC[4]=motor[5], MPC[5]=motor[9]
-// RF_HipA=2, RF_HipF=6, RF_Knee=10  -> MPC[6]=motor[2], MPC[7]=motor[6], MPC[8]=motor[10]
-// RR_HipA=3, RR_HipF=7, RR_Knee=11  -> MPC[9]=motor[3], MPC[10]=motor[7], MPC[11]=motor[11]
+// Motor index reordering:
+//   motor_indices[] order (matches hardware.motor_ids in yaml):
+//     [LF_HipA, LR_HipA, RF_HipA, RR_HipA,
+//      LF_HipF, LR_HipF, RF_HipF, RR_HipF,
+//      LF_Knee, LR_Knee, RF_Knee, RR_Knee]
+//   MPC joint order:
+//     [LF_HipA, LF_HipF, LF_Knee,
+//      LR_HipA, LR_HipF, LR_Knee,
+//      RF_HipA, RF_HipF, RF_Knee,
+//      RR_HipA, RR_HipF, RR_Knee]
+//   MPC_TO_MOTOR_IDX[mpc_idx] -> motor_indices[] subscript
 static const int MPC_TO_MOTOR_IDX[12] = {0,4,8, 1,5,9, 2,6,10, 3,7,11};
 
 // Per-joint position limits in RAW motor space (with offset, before gear-ratio removal).
@@ -100,16 +91,28 @@ static void startup_motors(std::shared_ptr<RobstrideController> rs,
     float vlim = (float)cfg.mit_vel_limit;
     float tlim = (float)cfg.mit_torque_limit;
 
-    // Bind and enable motors (same order as pure_cpp)
+    // Bind and enable motors in hardware.motor_ids order
+    // j = CAN bus index (0=LF,1=LR,2=RF,3=RR), i = joint index (0=HipA,1=HipF,2=Knee)
+    if ((int)cfg.can_interfaces.size() < 4) {
+        std::cerr << "[Startup] ERROR: need 4 CAN interfaces, got "
+                  << cfg.can_interfaces.size() << "\n";
+        return;
+    }
     for (int j = 0; j < 4; ++j) {
-        std::string can_if = std::string("candle") + CAN_IDS[j];
+        const std::string& can_if = cfg.can_interfaces[j];
         for (int i = 0; i < 3; ++i) {
-            int global_idx = j + i * 4;  // matches motor_indices ordering
+            int global_idx = j + i * 4;
             auto minfo = std::make_unique<RobstrideController::MotorInfo>();
-            minfo->motor_id = MOTOR_IDS[global_idx];
+            minfo->motor_id = cfg.motor_ids[global_idx];
             minfo->host_id  = 0xFD;
 
             int idx = rs->BindMotor(can_if.c_str(), std::move(minfo));
+            if (idx < 0) {
+                std::cerr << "[Startup] ERROR: BindMotor failed for motor_id="
+                          << cfg.motor_ids[global_idx]
+                          << " on " << can_if << " (CAN interface not found?)\n";
+                return;
+            }
             motor_indices[global_idx] = idx;
             rs->EnableMotor(idx);
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -149,62 +152,78 @@ static void startup_motors(std::shared_ptr<RobstrideController> rs,
 }
 
 // ============================================================
-// Read sensors from hardware into MPC structures
+// IMU sensor read
 // ============================================================
-// NOTE: IMUComponent::acc / gyro / quaternion are private.
-// To access raw data, add public getters to pure_cpp/Main/include/observations.hpp:
-//
-//   float const* get_quaternion() const { return quaternion; }
-//   float const* get_gyro()       const { return gyro; }
-//   float const* get_acc()        const { return acc; }
-//
-// Then replace the GetObs() call below with the direct accessor calls.
-//
-// Read raw IMU data via public accessors added to IMUComponent.
-// WIT IMU frame: X=right, Y=forward, Z=up  (right-hand).
-// Quaternion order from SDK: [q0=w, q1=x, q2=y, q3=z].
-// Gyro unit: deg/s (raw/32768 * 2000 deg/s), converted to rad/s by SDK before storage.
+// WIT IMU frame: X=right, Y=forward, Z=up.
+// Quaternion order: [q0=w, q1=x, q2=y, q3=z].
+// StateEstimator applies R_imu2body = [[0,1,0],[-1,0,0],[0,0,1]] internally.
 static void read_sensors(const std::shared_ptr<IMUComponent>& imu_comp,
                           IMUSensorData& imu_data)
 {
-    const float* q = imu_comp->get_quaternion();   // [w, x, y, z] in WIT frame
-    const float* g = imu_comp->get_gyro();         // [x, y, z] rad/s in WIT frame
-    const float* a = imu_comp->get_acc();          // [x, y, z] m/s^2 in WIT frame
-
-    // Pass raw WIT-frame data; StateEstimator applies R_imu2body = [[0,1,0],[-1,0,0],[0,0,1]]
+    const float* q = imu_comp->get_quaternion();
+    const float* g = imu_comp->get_gyro();
+    const float* a = imu_comp->get_acc();
     imu_data.quat      << q[0], q[1], q[2], q[3];
     imu_data.gyro_imu  << g[0], g[1], g[2];
     imu_data.accel_imu << a[0], a[1], a[2];
 }
 
-static void read_joints(const std::shared_ptr<RobstrideController>& rs,
-                         const std::vector<int>& motor_indices,
-                         const RobotConfig& cfg,
-                         Eigen::Matrix<double,12,1>& q_mpc,
-                         Eigen::Matrix<double,12,1>& dq_mpc,
-                         Eigen::Matrix<double,12,1>& tau_est)
+// ============================================================
+// Joint read + per-joint limit safety check (single motor state read per joint)
+// ============================================================
+// Each joint's motor_state is fetched exactly once to avoid:
+//   (a) redundant mutex acquisitions (was: safety check + read_joints = 2x per joint)
+//   (b) reading different values for the same joint across the two passes
+//
+// Returns false and prints an error if any joint exceeds its raw position limit.
+// Caller must trigger emergency stop when false is returned.
+//
+// motor_indices order: [LF_HipA, LR_HipA, RF_HipA, RR_HipA,
+//                       LF_HipF, LR_HipF, RF_HipF, RR_HipF,
+//                       LF_Knee, LR_Knee, RF_Knee, RR_Knee]
+// MPC order:           [LF_HipA, LF_HipF, LF_Knee,
+//                       LR_HipA, LR_HipF, LR_Knee, ...]
+static bool read_joints_safe(const std::shared_ptr<RobstrideController>& rs,
+                              const std::vector<int>& motor_indices,
+                              const RobotConfig& cfg,
+                              Eigen::Matrix<double,12,1>& q_mpc,
+                              Eigen::Matrix<double,12,1>& dq_mpc,
+                              Eigen::Matrix<double,12,1>& tau_est)
 {
-    // motor_indices order: [LF_HipA,LR_HipA,RF_HipA,RR_HipA, ...HipF..., ...Knee...]
-    // MPC order:           [LF_HipA,LF_HipF,LF_Knee, LR_HipA,...,RR_Knee]
+    bool ok = true;
     for (int mpc_idx = 0; mpc_idx < 12; ++mpc_idx) {
-        int motor_idx = motor_indices[MPC_TO_MOTOR_IDX[mpc_idx]];
+        int gi        = MPC_TO_MOTOR_IDX[mpc_idx];
+        int motor_idx = motor_indices[gi];
+
+        // Single read — holds motor_data_mutex for one call only
         auto ms = rs->GetMotorState(motor_idx);
 
-        double raw_pos = ms.position;
-        double raw_vel = ms.velocity;
-        double offset  = cfg.joint_offsets[MPC_TO_MOTOR_IDX[mpc_idx]];
+        // --- Limit check (raw motor space) ---
+        if (ms.position < JOINT_RAW_MIN[gi] - JOINT_LIMIT_MARGIN ||
+            ms.position > JOINT_RAW_MAX[gi] + JOINT_LIMIT_MARGIN) {
+            std::cerr << "[SAFETY] Joint " << mpc_idx
+                      << " (motor_id=" << cfg.motor_ids[gi]
+                      << ") raw_pos=" << ms.position
+                      << " outside safe range ["
+                      << JOINT_RAW_MIN[gi] << ", " << JOINT_RAW_MAX[gi]
+                      << "] — EMERGENCY STOP\n";
+            ok = false;
+            // Continue loop to report all violated joints before stopping
+        }
 
-        // Knee joints have gear ratio correction
-        bool is_knee = (mpc_idx % 3 == 2);
+        // --- Convert to MPC joint space ---
+        double offset  = cfg.joint_offsets[gi];
+        bool is_knee   = (mpc_idx % 3 == 2);
         if (is_knee) {
-            q_mpc[mpc_idx]   = (raw_pos - offset) / cfg.knee_gear_ratio;
-            dq_mpc[mpc_idx]  = raw_vel / cfg.knee_gear_ratio;
+            q_mpc[mpc_idx]  = (ms.position - offset) / cfg.knee_gear_ratio;
+            dq_mpc[mpc_idx] = ms.velocity / cfg.knee_gear_ratio;
         } else {
-            q_mpc[mpc_idx]   = raw_pos - offset;
-            dq_mpc[mpc_idx]  = raw_vel;
+            q_mpc[mpc_idx]  = ms.position - offset;
+            dq_mpc[mpc_idx] = ms.velocity;
         }
         tau_est[mpc_idx] = std::abs(ms.torque);
     }
+    return ok;
 }
 
 // ============================================================
@@ -273,6 +292,7 @@ struct SharedMPCData {
     Eigen::Vector3d v_cmd_body{0., 0., 0.};
     double yaw_rate_cmd{0.0};
     double gait_phase{0.0};
+    std::chrono::steady_clock::time_point last_update{std::chrono::steady_clock::now()};
     std::mutex mtx;
     bool initialized = false;
 };
@@ -354,10 +374,11 @@ static void mpc_thread_fn(RobotConfig cfg,
             std::lock_guard<std::mutex> lk(shared.mtx);
             for (int i = 0; i < 4; ++i)
                 shared.output.f_stance.row(i) = f_grf.segment<3>(i * 3).transpose();
-            shared.foot_target         = foot_targets;
+            shared.foot_target          = foot_targets;
             shared.output.solve_time_ms = mpc.last_solve_ms();
             shared.output.valid         = true;
             shared.initialized          = true;
+            shared.last_update          = std::chrono::steady_clock::now();
         }
 
         if (mpc.last_solve_ms() > 10.0)
@@ -505,36 +526,30 @@ int main(int argc, char* argv[]) {
         IMUSensorData imu_data;
         read_sensors(imu_comp, imu_data);
 
+        // Read all joint states once; also performs per-joint limit check.
+        // Motor state mutex is acquired exactly once per joint (12 total).
         Eigen::Matrix<double,12,1> q_mpc, dq_mpc, tau_est;
-        read_joints(rs, motor_indices, cfg, q_mpc, dq_mpc, tau_est);
-
-        // ===== 1b. Joint limit safety check =====
-        // Compare actual raw motor positions against physical limits.
-        // If any joint exceeds its limit + margin, trigger emergency stop.
-        {
-            bool limit_violated = false;
-            for (int mpc_idx = 0; mpc_idx < 12; ++mpc_idx) {
-                int gi = MPC_TO_MOTOR_IDX[mpc_idx];
-                int midx = motor_indices[gi];
-                float raw_pos = rs->GetMotorState(midx).position;
-                if (raw_pos < JOINT_RAW_MIN[gi] - JOINT_LIMIT_MARGIN ||
-                    raw_pos > JOINT_RAW_MAX[gi] + JOINT_LIMIT_MARGIN) {
-                    std::cerr << "[SAFETY] Joint " << mpc_idx
-                              << " raw_pos=" << raw_pos
-                              << " outside [" << JOINT_RAW_MIN[gi] << ", "
-                              << JOINT_RAW_MAX[gi] << "] — EMERGENCY STOP\n";
-                    limit_violated = true;
-                }
-            }
-            if (limit_violated) {
-                g_running = false;
-                break;
-            }
+        if (!read_joints_safe(rs, motor_indices, cfg, q_mpc, dq_mpc, tau_est)) {
+            g_running = false; break;
         }
 
         // ===== 2. State estimation =====
         estimator.update(imu_data, q_mpc, dq_mpc, tau_est, dt, startup_time);
         const RobotState& state = estimator.state();
+
+        // ===== 2b. Attitude emergency stop =====
+        // If the robot has fallen over, continuing to run MPC causes violent thrashing.
+        // Stop immediately when body tilt exceeds safe threshold.
+        if (calib_done) {
+            constexpr double TILT_LIMIT = 0.8;  // ~46 deg — well beyond any normal operation
+            if (std::abs(state.rpy[0]) > TILT_LIMIT ||
+                std::abs(state.rpy[1]) > TILT_LIMIT) {
+                std::cerr << "[SAFETY] Excessive tilt: roll=" << state.rpy[0]
+                          << " pitch=" << state.rpy[1] << " — EMERGENCY STOP\n";
+                g_running = false;
+                break;
+            }
+        }
 
         // ===== 3. Update shared state for MPC thread =====
         {
@@ -581,8 +596,18 @@ int main(int argc, char* argv[]) {
         {
             std::lock_guard<std::mutex> lk(shared_mpc.mtx);
             if (shared_mpc.initialized) {
-                mpc_cache        = shared_mpc.output;
+                mpc_cache         = shared_mpc.output;
                 foot_target_cache = shared_mpc.foot_target;
+
+                // MPC staleness check: if last solve was > 500ms ago, the MPC thread
+                // has likely hung. Zero out GRF to fall back to pure PD holding.
+                auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - shared_mpc.last_update).count();
+                if (age_ms > 500 && calib_done) {
+                    std::cerr << "[SAFETY] MPC output stale (" << age_ms
+                              << "ms) — zeroing GRF\n";
+                    mpc_cache.f_stance.setZero();
+                }
             }
         }
 
@@ -687,6 +712,18 @@ int main(int argc, char* argv[]) {
 
                     q_des_swing.segment<3>(idx) += dq_des * dt;
 
+                    // Anti-windup: clamp q_des_swing to per-joint MPC-space limits
+                    // so the integrator doesn't drift beyond the physical range.
+                    // MPC-space limit = (raw_limit - offset) / gear
+                    for (int j = 0; j < 3; ++j) {
+                        int gi_j  = MPC_TO_MOTOR_IDX[idx + j];
+                        bool knee = (j == 2);
+                        double gr = knee ? cfg.knee_gear_ratio : 1.0;
+                        double lo = ((double)JOINT_RAW_MIN[gi_j] - cfg.joint_offsets[gi_j]) / gr;
+                        double hi = ((double)JOINT_RAW_MAX[gi_j] - cfg.joint_offsets[gi_j]) / gr;
+                        q_des_swing[idx + j] = math_utils::clamp(q_des_swing[idx + j], lo, hi);
+                    }
+
                     q_des.segment<3>(idx)  = q_des_swing.segment<3>(idx);
                     kp_vec.segment<3>(idx).setConstant(cfg.kp_swing);
                     kd_vec.segment<3>(idx).setConstant(cfg.kd_swing);
@@ -696,8 +733,9 @@ int main(int argc, char* argv[]) {
             for (int i = 0; i < 4; ++i) prev_contact[i] = gait_out.contact[i];
         }
 
-        // Safety: NaN check on WBC output
-        if (tau_ff.hasNaN()) tau_ff.setZero();
+        // Safety: NaN/Inf check — zero bad outputs rather than sending them to motors
+        if (tau_ff.hasNaN() || !tau_ff.allFinite()) tau_ff.setZero();
+        if (q_des.hasNaN()  || !q_des.allFinite())  q_des = Eigen::Matrix<double,12,1>::Zero();
 
         // ===== 9. Send motor commands =====
         send_motor_commands(rs, motor_indices, cfg, q_des, tau_ff, kp_vec, kd_vec);

@@ -8,81 +8,77 @@ robot:
   L1: 0.0675   # hip abduction link
   L2: 0.21     # thigh
   L3: 0.24     # shank
-  # Hip joint positions in body frame (LF, LR, RF, RR)
+  # Hip joint positions in body frame (LF, LR, RF, RR) [m]
   hip_offsets:
     - [ 0.16,  0.0675, 0.0]
     - [-0.16,  0.0675, 0.0]
     - [ 0.16, -0.0675, 0.0]
     - [-0.16, -0.0675, 0.0]
-  # Initial joint angles (LF_HipA, LR_HipA, RF_HipA, RR_HipA,
-  #                        LF_HipF, LR_HipF, RF_HipF, RR_HipF,
-  #                        LF_Knee, LR_Knee, RF_Knee, RR_Knee)
-  # This is in the pure_cpp offset-subtracted frame
-  # q_des = joint_offsets (zero-torque default pose)
+  # Stand pose in offset-subtracted joint space (0 = at joint_offsets position)
+  # Order: LF_HipA, LR_HipA, RF_HipA, RR_HipA, HipF×4, Knee×4
   stand_joint_angles: [0.0, 0.0, 0.0, 0.0,
-                        0.0, 0.0, 0.0, 0.0,
-                        0.0, 0.0, 0.0, 0.0]
-  target_z: 0.2
+                       0.0, 0.0, 0.0, 0.0,
+                       0.0, 0.0, 0.0, 0.0]
+  target_z: 0.2    # desired body height [m]
 
 gait:
-  period: 0.4
-  duty_factor: 0.5
-  step_height: 0.06
-  # Phase offsets: LF, LR, RF, RR (Trot: LF+RR in phase, LR+RF in phase)
+  period: 0.4        # [s] full trot cycle
+  duty_factor: 0.5   # fraction of cycle in stance
+  step_height: 0.06  # [m] swing foot clearance
+  # Phase offsets: LF, LR, RF, RR  (Trot: LF+RR together, LR+RF together)
   phase_offsets: [0.0, 0.5, 0.5, 0.0]
 
 mpc:
-  freq: 30.0
-  horizon: 10
-  mu: 0.5
-  f_min: 0.0
-  f_max: 150.0
-  weights_Q: [150.0, 150.0, 50.0, 0.0, 50.0, 150.0,
-              20.0,  20.0,  20.0, 10.0, 10.0, 10.0]
-  weights_R: 1.0e-5
+  freq: 30.0         # [Hz] MPC solve rate
+  horizon: 10        # prediction steps
+  mu: 0.5            # friction coefficient
+  f_min: 0.0         # min normal GRF [N]
+  f_max: 150.0       # max normal GRF [N]
+  # State weights [roll, pitch, yaw, px, py, pz, wx, wy, wz, vx, vy, vz]
+  weights_Q: [150.0, 150.0,  50.0, 0.0, 50.0, 150.0,
+               20.0,  20.0,  20.0, 10.0, 10.0,  10.0]
+  weights_R: 1.0e-5  # GRF regularisation
+  # NMPC solver settings (NMPCFootstepPlanner — not active in current main)
   ipopt_max_iter: 30
   ipopt_tol: 1.0e-2
 
 control:
+  # Calibration phase PD (while standing still during IMU bias calibration)
   kp_stand: 100.0
   kd_stand: 2.0
+  # Swing leg impedance (IK trajectory tracking)
   kp_swing: 150.0
   kd_swing: 8.0
+  # Stance leg impedance (combined with WBC tau_ff)
   kp_stance: 30.0
   kd_stance: 2.0
-  torque_limit: 40.0
-  # NMPC footstep EMA filter (0=no update, 1=full update)
-  nmpc_alpha: 0.2
-  # Velocity command EMA filter
-  vcmd_alpha: 0.05
 
 hardware:
   can_interfaces: ["candle0", "candle1", "candle2", "candle3"]
   imu_device: "/dev/ttyCH341USB0"
   gamepad_device: "/dev/input/js0"
-  # Motor IDs on each CAN bus (one motor per leg per bus)
-  # Bus i -> motor with id motor_ids[j + i*4] for leg j
+  # Motor IDs, order: LF_HipA, LR_HipA, RF_HipA, RR_HipA,
+  #                   LF_HipF, LR_HipF, RF_HipF, RR_HipF,
+  #                   LF_Knee, LR_Knee, RF_Knee, RR_Knee
   motor_ids: [1, 5, 9, 13,
-               2, 6, 10, 14,
-               3, 7, 11, 15]
+              2, 6, 10, 14,
+              3, 7, 11, 15]
+  # MIT mode PD gains (applied at motor driver ~10kHz)
   mit_kp: 40.0
   mit_kd: 0.5
-  mit_vel_limit: 44.0
-  mit_torque_limit: 17.0
-  # Gear ratio for knee joints
-  knee_gear_ratio: 1.667
-  # Joint offsets (raw encoder zero = robot at offset position)
-  # Order: LF_HipA, LR_HipA, RF_HipA, RR_HipA,
-  #        LF_HipF, LR_HipF, RF_HipF, RR_HipF,
-  #        LF_Knee, LR_Knee, RF_Knee, RR_Knee
+  mit_vel_limit: 44.0       # [rad/s] motor velocity clamp
+  mit_torque_limit: 17.0    # [Nm]  hardware limit — do not exceed
+  knee_gear_ratio: 1.667    # motor shaft angle / joint angle
+  # Raw encoder readings when robot is at stand pose (joint_offsets = zero point)
+  # Calibrate with: sudo ./build/test_single_joint all
+  # Order matches motor_ids above
   joint_offsets: [ 0.37, -0.37, -0.37,  0.37,
-                    0.13,  0.13, -0.13, -0.13,
-                    1.7681, 1.7681, -1.7681, -1.7681]
-  # Contact detection threshold (Nm motor current estimate)
-  contact_torque_threshold: 2.0
+                   0.13,  0.13, -0.13, -0.13,
+                   1.7681, 1.7681, -1.7681, -1.7681]
+  contact_torque_threshold: 2.0  # [Nm] for stance/swing contact detection
 
 estimator:
-  alpha_v: 0.02      # velocity complementary filter (kinematic weight)
-  alpha_z: 0.1       # height complementary filter
-  alpha_bias: 0.01   # acc bias low-pass filter
-  calib_duration: 2.0  # seconds of IMU bias calibration at startup
+  alpha_v: 0.02       # velocity complementary filter (kinematic weight 0~1)
+  alpha_z: 0.1        # height complementary filter
+  alpha_bias: 0.01    # IMU accel bias low-pass filter
+  calib_duration: 2.0 # [s] hold still at startup for IMU bias calibration
