@@ -236,6 +236,31 @@ target_link_libraries(test_joystick
     ${LIBUSB_LIBRARIES}
 )
 
+# IMU 3D visualizer web server (no motors, safe to run anytime)
+# Serves a Three.js 3D visualization over HTTP + SSE.
+# Usage: sudo ./build/imu_viz_server [config_path] [port]
+add_executable(imu_viz_server
+    src/common/robot_config.cpp
+    ${DRIVER_DIR}/src/robstride.cpp
+    ${DRIVER_DIR}/src/can_interface.cpp
+    ${DRIVER_DIR}/src/serial.c
+    ${DRIVER_DIR}/src/wit_c_sdk.c
+    ${DRIVER_DIR}/src/observations.cpp
+    tests/imu_viz_server.cpp
+)
+target_include_directories(imu_viz_server PUBLIC
+    include
+    ${DRIVER_DIR}/include
+    ${LIBUSB_INCLUDE_DIRS}
+    ${EIGEN3_INCLUDE_DIR}
+)
+target_link_libraries(imu_viz_server
+    Threads::Threads
+    Eigen3::Eigen
+    yaml-cpp
+    ${LIBUSB_LIBRARIES}
+)
+
 # ============================================================
 # Build summary
 # ============================================================
