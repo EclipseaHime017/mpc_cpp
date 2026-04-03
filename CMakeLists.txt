@@ -100,6 +100,11 @@ set(HW_SOURCES
     ${DRIVER_DIR}/src/observations.cpp
 )
 
+set(COMMON_SOURCES
+    src/common/robot_config.cpp
+    src/kinematics/quadruped_kin.cpp
+)
+
 # ============================================================
 # MPC controller sources
 # ============================================================
@@ -205,6 +210,25 @@ target_include_directories(test_single_joint PUBLIC
     ${EIGEN3_INCLUDE_DIR}
 )
 target_link_libraries(test_single_joint
+    Threads::Threads
+    Eigen3::Eigen
+    yaml-cpp
+    ${LIBUSB_LIBRARIES}
+)
+
+add_executable(test_position_control
+    src/common/robot_config.cpp
+    src/kinematics/quadruped_kin.cpp
+    ${HW_SOURCES}
+    tests/test_position_control.cpp
+)
+target_include_directories(test_position_control PUBLIC
+    include
+    ${DRIVER_DIR}/include
+    ${LIBUSB_INCLUDE_DIRS}
+    ${EIGEN3_INCLUDE_DIR}
+)
+target_link_libraries(test_position_control
     Threads::Threads
     Eigen3::Eigen
     yaml-cpp
