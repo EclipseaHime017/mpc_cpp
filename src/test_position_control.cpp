@@ -138,10 +138,27 @@ int main(int argc, char* argv[]) {
     double phases[4] = {0.0, 0.5, 0.5, 0.0}; // Trot 初始相位
     Eigen::Matrix<double, 4, 3> nominal_foots; // 初始标定足端位置
     
-    // 计算站立状态下的足端基准位置
-    for(int i=0; i<4; ++i) {
-        Eigen::Vector3d q_leg = cfg.stand_joint_angles.segment<3>(i*3);
-        nominal_foots.row(i) = kin.fk_foot(i, q_leg).transpose();
+    // 计算站立状态下的足端基准位置（几何法，z 正方向朝下）
+    // 参考 pd-control-observed-hfield：nominal foot = (hip.x, hip.y ± L1, target_z)
+    for (int i = 0; i < 4; ++i) {
+        double s = (cfg.hip_offsets(i, 1) > 0) ? 1.0 : -1.0;  // +1 左腿, -1 右腿
+        nominal_foots(i, 0) = cfg.hip_offsets(i, 0);
+        nominal_foots(i, 1) = cfg.hip_offsets(i, 1) + s * cfg.L1;
+        nominal_foots(i, 2) = cfg.target_z;
+    }
+
+    // 参考 Python 的 q_cmd = q_abs - q_offset：
+    // IK 返回 FK 坐标系中的绝对角度，发送电机前需减去站立参考角，
+    // 这样 nominal 姿态时 pos_raw = joint_offsets（与 startup 目标一致，无跳变）。
+    Eigen::Matrix<double, 12, 1> q_stand_abs = Eigen::Matrix<double, 12, 1>::Zero();
+    for (int i = 0; i < 4; ++i) {
+        Eigen::Vector3d q_leg;
+        if (kin.ik_foot(i, nominal_foots.row(i).transpose(), q_leg)) {
+            q_stand_abs.segment<3>(i * 3) = q_leg;
+        } else {
+            std::cerr << "[FATAL] IK failed for nominal stand pose leg " << i << std::endl;
+            return 1;
+        }
     }
 
     // 4. 主循环 (500Hz)
@@ -190,7 +207,7 @@ int main(int argc, char* argv[]) {
                 // 摆动起点应在步长负半轴，终点在正半轴
                 foot_p = nominal_foots.row(i).transpose();
                 foot_p.x() += (offset.x() - step_len * 0.5);
-                foot_p.z() += offset.z();
+                foot_p.z() -= offset.z();  // z 正方向朝下，抬脚 = z 减小
             } 
             else { // 支撑相 (Stance)
                 double stance_t = (t - 0.5) / 0.5;
@@ -209,7 +226,7 @@ int main(int argc, char* argv[]) {
                 // IK 失败则退回到站立姿态，避免崩溃
                 std::cout << "[WARN] IK failed leg " << i
                           << " foot_p=(" << foot_p.x() << "," << foot_p.y() << "," << foot_p.z() << ")" << std::endl;
-                q_des.segment<3>(i * 3) = cfg.stand_joint_angles.segment<3>(i * 3);
+                q_des.segment<3>(i * 3) = q_stand_abs.segment<3>(i * 3);  // fallback 到站立角
             }
         }
 
@@ -222,8 +239,9 @@ int main(int argc, char* argv[]) {
             bool is_knee = (mpc_idx % 3 == 2);
             double gear = is_knee ? cfg.knee_gear_ratio : 1.0;
             
-            // 目标角度 = 关节角 * 减速比 + 零位偏移
-            double pos_raw = q_des[mpc_idx] * gear + offset;
+            // 目标角度：减去站立参考角（q_stand_abs），确保 nominal 姿态 → pos_raw = joint_offsets
+            // 对应 Python 的 q_cmd = q_abs - q_offset
+            double pos_raw = (q_des[mpc_idx] - q_stand_abs[mpc_idx]) * gear + offset;
 
             // MIT 模式：摆动腿用 kp_swing，支撑腿用 kp_stance，扭矩前馈填 0
             int leg_i = mpc_idx / 3;
