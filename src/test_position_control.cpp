@@ -2,6 +2,7 @@
 // 机器人位置控制测试 - 基于摆线轨迹与 PD 控制
 // =============================================================================
 #include <iostream>
+#include <memory>
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -10,10 +11,10 @@
 #include <cmath>
 #include <vector>
 
+#include <Eigen/Dense>
 #include "robstride.hpp"
 #include "observations.hpp"
 #include "common/robot_config.hpp"
-#include "common/math_utils.hpp"
 #include "kinematics/quadruped_kin.hpp"
 
 // 信号处理
@@ -38,7 +39,7 @@ Eigen::Vector3d calculate_cycloid(double t, double step_len, double step_height)
     if (t < 0.5) {
         z = 2.0 * step_height * (2.0 * t - (1.0 / (2.0 * M_PI)) * std::sin(4.0 * M_PI * t));
     } else {
-        z = 2.0 * step_height * (2.0 * (1.0 - t) - (1.0 / (2.0 * M_PI)) * std::sin(4.0 * (1.0 - t)));
+        z = 2.0 * step_height * (2.0 * (1.0 - t) - (1.0 / (2.0 * M_PI)) * std::sin(4.0 * M_PI * (1.0 - t)));
     }
     return Eigen::Vector3d(x, 0, z);
 }
@@ -80,7 +81,8 @@ int main(int argc, char* argv[]) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             
             // 设置默认的 MIT 模式参数和限幅
-            rs->SetMITParams(idx, {80.0f, 1.5f, 44.0f, 17.0f}); 
+            rs->SetMITParams(idx, {(float)cfg.kp_swing, (float)cfg.mit_kd,
+                                   (float)cfg.mit_vel_limit, (float)cfg.mit_torque_limit});
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
     }
@@ -89,15 +91,23 @@ int main(int argc, char* argv[]) {
     std::cout << "[Init] 等待系统就绪..." << std::endl;
     std::this_thread::sleep_for(std::chrono::seconds(1));
 
-    // 3. 初始标定与平滑起立动作 (匍匐 -> 站立)
-    std::cout << "[Init] 执行起立动作 (匍匐 -> 站立)..." << std::endl;
-    
-    // 我们用 2 秒钟（1000个2ms的步长）来完成从 0 到目标站立角度的插值
-    unsigned int startup_interval = 1000; 
+    // 3. 初始标定与平滑起立动作 (当前位置 -> 站立)
+    std::cout << "[Init] 执行起立动作 (当前位置 -> 站立)..." << std::endl;
+
+    // 读取各关节当前位置作为插值起点，避免第一帧突变
+    std::vector<double> start_pos_raw(12);
+    for (int mpc_idx = 0; mpc_idx < 12; ++mpc_idx) {
+        int gi = MPC_TO_MOTOR_IDX[mpc_idx];
+        int motor_idx = motor_indices[gi];
+        start_pos_raw[mpc_idx] = rs->GetMotorState(motor_idx).position;
+    }
+
+    // 用 2 秒钟（1000个2ms的步长）从当前位置插值到目标站立角度
+    unsigned int startup_interval = 1000;
     for (unsigned int step = 1; step <= startup_interval; ++step) {
         if (!g_running) break;
         float factor = (float)step / (float)startup_interval;
-        
+
         for (int mpc_idx = 0; mpc_idx < 12; ++mpc_idx) {
             int gi = MPC_TO_MOTOR_IDX[mpc_idx];
             int motor_idx = motor_indices[gi];
@@ -105,15 +115,16 @@ int main(int argc, char* argv[]) {
 
             bool is_knee = (mpc_idx % 3 == 2);
             double gear = is_knee ? cfg.knee_gear_ratio : 1.0;
-            
+
             // 目标站立角度的物理绝对位置
             double target_pos_raw = cfg.stand_joint_angles[mpc_idx] * gear + offset;
-            
-            // 根据 factor 进行从 0 (匍匐状态) 到 target_pos_raw 的线性插值
-            double current_pos_raw = target_pos_raw * factor;
 
-            // 给定适当的 PD 参数执行平滑移动
-            rs->SendMITCommand(motor_idx, (float)current_pos_raw, 0.0f, 80.0f, 1.5f, 0.0f);
+            // 从实际当前位置插值到目标，避免第一帧跳变
+            double current_pos_raw = start_pos_raw[mpc_idx] * (1.0 - factor) + target_pos_raw * factor;
+
+            // 给定适当的 PD 参数执行平滑移动 (起立阶段用 kp_stand)
+            rs->SendMITCommand(motor_idx, (float)current_pos_raw, 0.0f,
+                               (float)cfg.kp_stand, (float)cfg.mit_kd, 0.0f);
         }
         // 500Hz 控制频率的休眠
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -130,7 +141,7 @@ int main(int argc, char* argv[]) {
     // 计算站立状态下的足端基准位置
     for(int i=0; i<4; ++i) {
         Eigen::Vector3d q_leg = cfg.stand_joint_angles.segment<3>(i*3);
-        nominal_foots.row(i) = kin.forward_kinematics(i, q_leg).transpose();
+        nominal_foots.row(i) = kin.fk_foot(i, q_leg).transpose();
     }
 
     // 4. 主循环 (500Hz)
@@ -181,7 +192,7 @@ int main(int argc, char* argv[]) {
 
             // C. 逆运动学求解得到关节角
             Eigen::Vector3d q_leg;
-            if (kin.inverse_kinematics(i, foot_p, q_leg)) {
+            if (kin.ik_foot(i, foot_p, q_leg)) {
                 q_des.segment<3>(i * 3) = q_leg;
             } else {
                 // IK 失败则退回到站立姿态，避免崩溃
@@ -201,8 +212,12 @@ int main(int argc, char* argv[]) {
             // 目标角度 = 关节角 * 减速比 + 零位偏移
             double pos_raw = q_des[mpc_idx] * gear + offset;
 
-            // MIT 模式：由于是纯位控，扭矩前馈填 0.0f
-            rs->SendMITCommand(motor_idx, (float)pos_raw, 0.0f, 80.0f, 1.5f, 0.0f);
+            // MIT 模式：摆动腿用 kp_swing，支撑腿用 kp_stance，扭矩前馈填 0
+            int leg_i = mpc_idx / 3;
+            bool in_swing = (phases[leg_i] < 0.5);
+            float kp = in_swing ? (float)cfg.kp_swing : (float)cfg.kp_stance;
+            float kd = in_swing ? (float)cfg.mit_kd    : (float)cfg.kd_stance;
+            rs->SendMITCommand(motor_idx, (float)pos_raw, 0.0f, kp, kd, 0.0f);
         }
 
         std::this_thread::sleep_until(next_tick);

@@ -220,7 +220,7 @@ add_executable(test_position_control
     src/common/robot_config.cpp
     src/kinematics/quadruped_kin.cpp
     ${HW_SOURCES}
-    tests/test_position_control.cpp
+    src/test_position_control.cpp
 )
 target_include_directories(test_position_control PUBLIC
     include
