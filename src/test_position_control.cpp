@@ -147,15 +147,26 @@ int main(int argc, char* argv[]) {
     // 4. 主循环 (500Hz)
     auto next_tick = std::chrono::steady_clock::now();
     std::cout << "[Loop] 进入控制循环，使用左摇杆控制前进/后退速度" << std::endl;
+    int loop_count = 0;
 
     while (g_running) {
         next_tick += std::chrono::microseconds(2000);
         double dt = 0.002;
 
+        ++loop_count;
+
         // A. 获取遥控器输入
         double vx = 0.0;
         if (gamepad->IsConnected()) {
             vx = -gamepad->GetAxis(1) * 0.4; // 最大速度设定为 0.4 m/s
+        }
+
+        // 每秒打印一次 vx 和 step_len，用于调试
+        if (loop_count % 500 == 0) {
+            double step_len_dbg = vx * gait_period * 0.5;
+            std::cout << "[DBG] vx=" << vx << " step_len=" << step_len_dbg
+                      << " phases=[" << phases[0] << "," << phases[1]
+                      << "," << phases[2] << "," << phases[3] << "]" << std::endl;
         }
 
         // B. 计算每个腿的目标
@@ -196,6 +207,8 @@ int main(int argc, char* argv[]) {
                 q_des.segment<3>(i * 3) = q_leg;
             } else {
                 // IK 失败则退回到站立姿态，避免崩溃
+                std::cout << "[WARN] IK failed leg " << i
+                          << " foot_p=(" << foot_p.x() << "," << foot_p.y() << "," << foot_p.z() << ")" << std::endl;
                 q_des.segment<3>(i * 3) = cfg.stand_joint_angles.segment<3>(i * 3);
             }
         }

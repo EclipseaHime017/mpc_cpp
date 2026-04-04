@@ -265,9 +265,6 @@ void Gamepad::ReadLoop() {
                 if (event.number < JS_AXIS_LIMIT) {
                     std::lock_guard<std::mutex> lock(data_mutex);
                     axes[event.number] = (float)event.value / 32767.0f;
-                    std::cout << "[Gamepad] Axis " << (int)event.number 
-                              << " Value: " << event.value 
-                              << " Norm: " << axes[event.number] << std::endl;
                 }
             } else if (event.type & JS_EVENT_BUTTON) {
                 std::cout << "[Gamepad] Button " << (int)event.number 
