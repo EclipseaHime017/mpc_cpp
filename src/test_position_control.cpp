@@ -223,11 +223,7 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_until(next_tick);
     }
 
-    // 5. 关机逻辑
-    std::cout << "\n[Shutdown] 停止电机..." << std::endl;
-    for (int i = 0; i < 12; ++i) {
-        rs->SendMITCommand(motor_indices[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-        rs->DisableMotor(motor_indices[i]);
-    }
+    // 5. 关机
+    std::cout << "\n[Shutdown] 完成。" << std::endl;
     return 0;
 }
