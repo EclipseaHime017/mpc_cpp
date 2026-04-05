@@ -85,7 +85,7 @@ bool QuadrupedKinematics::ik_foot(int leg_idx, const Eigen::Vector3d& p_body,
     double pz_after = std::sqrt(r_yz*r_yz - L1*L1);  // effective z distance
     double D = std::sqrt(px*px + pz_after*pz_after);  // 2D distance to foot
 
-    if (D > L2 + L3 || D < std::abs(L2 - L3)) return false;
+    if (D > L2 + L3 + 1e-6 || D < std::abs(L2 - L3) - 1e-6) return false;
 
     // Solve q3 (knee, using cosine rule)
     double cos_q3 = (D*D - L2*L2 - L3*L3) / (2.0 * L2 * L3);

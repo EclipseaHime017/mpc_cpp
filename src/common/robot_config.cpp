@@ -139,6 +139,13 @@ RobotConfig RobotConfig::from_yaml(const std::string& path) {
         opt_d(hw, "mit_torque_limit",         cfg.mit_torque_limit);
         opt_d(hw, "knee_gear_ratio",          cfg.knee_gear_ratio);
         opt_d(hw, "contact_torque_threshold", cfg.contact_torque_threshold);
+        if (hw["joint_limits"]) {
+            auto v = hw["joint_limits"].as<std::vector<double>>();
+            if ((int)v.size() == 6)
+                for (int i = 0; i < 6; ++i) cfg.joint_limits[i] = v[i];
+            else
+                std::cerr << "[RobotConfig] hardware.joint_limits must have 6 values — skipped\n";
+        }
         if (hw["joint_offsets"]) {
             auto v = hw["joint_offsets"].as<std::vector<double>>();
             if ((int)v.size() == 12)

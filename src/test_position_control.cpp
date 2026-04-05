@@ -233,9 +233,14 @@ int main(int argc, char* argv[]) {
 
             bool is_knee = (mpc_idx % 3 == 2);
             double gear = is_knee ? cfg.knee_gear_ratio : 1.0;
-            
+
+            // 关节角度限幅，防止超行程卡死 (joint_type: 0=HipA, 1=HipF, 2=Knee)
+            int joint_type = mpc_idx % 3;
+            double q_clamped = std::max(cfg.joint_limits[joint_type * 2],
+                               std::min(cfg.joint_limits[joint_type * 2 + 1], q_des[mpc_idx]));
+
             // nominal 时 q_des=0 → pos_raw=joint_offsets（与 startup 一致，h0 已在 IK 输入中修正）
-            double pos_raw = q_des[mpc_idx] * gear + offset;
+            double pos_raw = q_clamped * gear + offset;
 
             // MIT 模式：摆动腿用 kp_swing，支撑腿用 kp_stance，扭矩前馈填 0
             int leg_i = mpc_idx / 3;

@@ -75,6 +75,10 @@ struct RobotConfig {
 
     double contact_torque_threshold = 2.0;  // [Nm] for contact detection
 
+    // Joint angle limits [rad] in offset-subtracted (q_des) frame
+    // Order: [HipA_min, HipA_max, HipF_min, HipF_max, Knee_min, Knee_max]
+    std::array<double, 6> joint_limits{-0.5, 0.5, -1.5, 1.5, -2.5, 0.0};
+
     // ----- State estimator -----
     double alpha_v        = 0.02;  // velocity complementary filter (kinematic weight)
     double alpha_z        = 0.1;   // height complementary filter
