@@ -45,14 +45,14 @@ mpc:
 
 control:
   # Calibration phase PD (while standing still during IMU bias calibration)
-  kp_stand: 100.0
+  kp_stand: 40.0   # ref: mit_kp=40
   kd_stand: 2.0
   # Swing leg impedance (IK trajectory tracking)
-  kp_swing: 150.0
-  kd_swing: 8.0
+  kp_swing: 40.0   # ref: mit_kp=40
+  kd_swing: 2.0    # MIT协议 KD_MAX=5.0
   # Stance leg impedance (combined with WBC tau_ff)
-  kp_stance: 30.0
-  kd_stance: 2.0
+  kp_stance: 20.0
+  kd_stance: 1.0
 
 hardware:
   can_interfaces: ["candle0", "candle1", "candle2", "candle3"]
@@ -77,9 +77,15 @@ hardware:
                    0.13,  0.13, -0.13, -0.13,
                    1.7681, 1.7681, -1.7681, -1.7681]
   contact_torque_threshold: 2.0  # [Nm] for stance/swing contact detection
-  # Joint angle limits [rad] in offset-subtracted (q_des) frame
-  # [HipA_min, HipA_max, HipF_min, HipF_max, Knee_min, Knee_max]
-  joint_limits: [-0.5, 0.5, -1.5, 1.5, -2.5, 0.0]
+  # Joint shaft limits [rad] in raw motor shaft (pos_raw) space.
+  # Order: LF, LR, RF, RR per type (HipA × 4, HipF × 4, Knee × 4).
+  # Source: JOINT_SHAFT_MIN/MAX in mpc_cpp/src/main.cpp and pure_cpp/Main/src/main.cpp.
+  joint_shaft_min: [-0.7853982, -0.7853982, -0.7853982, -0.7853982,
+                    -1.2217658, -1.2217305, -0.8726999, -0.8726999,
+                    -2.0366407, -2.0366407, -0.6,       -0.6      ]
+  joint_shaft_max: [ 0.7853982,  0.7853982,  0.7853982,  0.7853982,
+                     0.8726683,  0.8726683,  1.2217342,  1.2217305,
+                     0.6,        0.6,        2.0366265,  2.0366265 ]
 
 estimator:
   alpha_v: 0.02       # velocity complementary filter (kinematic weight 0~1)

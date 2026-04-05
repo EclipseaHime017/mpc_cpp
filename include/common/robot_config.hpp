@@ -75,9 +75,12 @@ struct RobotConfig {
 
     double contact_torque_threshold = 2.0;  // [Nm] for contact detection
 
-    // Joint angle limits [rad] in offset-subtracted (q_des) frame
-    // Order: [HipA_min, HipA_max, HipF_min, HipF_max, Knee_min, Knee_max]
-    std::array<double, 6> joint_limits{-0.5, 0.5, -1.5, 1.5, -2.5, 0.0};
+    // Joint shaft limits [rad] in raw motor shaft (pos_raw) space.
+    // Same index order as motor_ids: LF/LR/RF/RR per joint type.
+    // Clamping in shaft space avoids the sign-flip issue of per-leg offsets.
+    // Values mirror JOINT_SHAFT_MIN/MAX in mpc_cpp/src/main.cpp.
+    Eigen::Matrix<double, 12, 1> joint_shaft_min;
+    Eigen::Matrix<double, 12, 1> joint_shaft_max;
 
     // ----- State estimator -----
     double alpha_v        = 0.02;  // velocity complementary filter (kinematic weight)

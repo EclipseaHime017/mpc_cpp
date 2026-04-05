@@ -21,6 +21,15 @@ RobotConfig::RobotConfig() {
     joint_offsets <<  0.37, -0.37, -0.37,  0.37,
                       0.13,  0.13, -0.13, -0.13,
                   1.7681, 1.7681, -1.7681, -1.7681;
+
+    // Joint shaft limits (pos_raw space). Mirror of JOINT_SHAFT_MIN/MAX in main.cpp.
+    // Order: LF, LR, RF, RR per type (HipA, HipF, Knee).
+    joint_shaft_min << -0.7853982, -0.7853982, -0.7853982, -0.7853982,
+                       -1.2217658, -1.2217305, -0.8726999, -0.8726999,
+                       -1.2217299*1.667, -1.2217299*1.667, -0.6, -0.6;
+    joint_shaft_max <<  0.7853982,  0.7853982,  0.7853982,  0.7853982,
+                        0.8726683,  0.8726683,  1.2217342,  1.2217305,
+                        0.6, 0.6, 1.2217287*1.667, 1.2217287*1.667;
 }
 
 RobotConfig RobotConfig::from_yaml(const std::string& path) {
@@ -139,12 +148,19 @@ RobotConfig RobotConfig::from_yaml(const std::string& path) {
         opt_d(hw, "mit_torque_limit",         cfg.mit_torque_limit);
         opt_d(hw, "knee_gear_ratio",          cfg.knee_gear_ratio);
         opt_d(hw, "contact_torque_threshold", cfg.contact_torque_threshold);
-        if (hw["joint_limits"]) {
-            auto v = hw["joint_limits"].as<std::vector<double>>();
-            if ((int)v.size() == 6)
-                for (int i = 0; i < 6; ++i) cfg.joint_limits[i] = v[i];
+        if (hw["joint_shaft_min"]) {
+            auto v = hw["joint_shaft_min"].as<std::vector<double>>();
+            if ((int)v.size() == 12)
+                for (int i = 0; i < 12; ++i) cfg.joint_shaft_min[i] = v[i];
             else
-                std::cerr << "[RobotConfig] hardware.joint_limits must have 6 values — skipped\n";
+                std::cerr << "[RobotConfig] hardware.joint_shaft_min must have 12 values — skipped\n";
+        }
+        if (hw["joint_shaft_max"]) {
+            auto v = hw["joint_shaft_max"].as<std::vector<double>>();
+            if ((int)v.size() == 12)
+                for (int i = 0; i < 12; ++i) cfg.joint_shaft_max[i] = v[i];
+            else
+                std::cerr << "[RobotConfig] hardware.joint_shaft_max must have 12 values — skipped\n";
         }
         if (hw["joint_offsets"]) {
             auto v = hw["joint_offsets"].as<std::vector<double>>();
