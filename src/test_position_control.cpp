@@ -122,49 +122,43 @@ int main(int argc, char* argv[]) {
             // 从实际当前位置插值到目标，避免第一帧跳变
             double current_pos_raw = start_pos_raw[mpc_idx] * (1.0 - factor) + target_pos_raw * factor;
 
-            // 给定适当的 PD 参数执行平滑移动 (起立阶段用 kp_stand)
+            // 给定适当的 PD 参数执行平滑移动 (起立阶段用 kp_stand / kd_stand)
             rs->SendMITCommand(motor_idx, (float)current_pos_raw, 0.0f,
-                               (float)cfg.kp_stand, (float)cfg.mit_kd, 0.0f);
+                               (float)cfg.kp_stand, (float)cfg.kd_stand, 0.0f);
         }
         // 500Hz 控制频率的休眠
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
     std::cout << "[Init] 起立完成！" << std::endl;
 
-    // 准备运动控制参数
-    double gait_period = 0.5;   // 步态周期 (s)
-    double step_height = 0.06;  // 抬腿高度 (m)
-    
-    double phases[4] = {0.0, 0.5, 0.5, 0.0}; // Trot 初始相位
+    // 准备运动控制参数（从 cfg 读取，避免与 YAML 不一致）
+    const double swing_frac  = 1.0 - cfg.duty_factor;  // 摆动相占比
+    const double stance_frac = cfg.duty_factor;         // 支撑相占比
+
+    double phases[4];
+    for (int i = 0; i < 4; ++i) phases[i] = cfg.phase_offsets[i]; // Trot 初始相位
     Eigen::Matrix<double, 4, 3> nominal_foots; // 初始标定足端位置
     
+    // 高度偏移 h0：简化运动学模型中 q=0 时 pz=L2+L3（腿完全伸直），
+    // 而物理上 motor=joint_offsets 时站高为 z_zero。
+    // 因此对任意目标高度 h，IK 输入 pz_model = h + h0，
+    // 当 h = z_zero 时 pz_model = L2+L3 → IK 返回 q=0 → motor=joint_offsets（与 startup 一致）。
+    double h0 = (cfg.L2 + cfg.L3) - cfg.z_zero;
+
     // 计算站立状态下的足端基准位置（几何法，z 正方向朝下）
-    // 参考 pd-control-observed-hfield：nominal foot = (hip.x, hip.y ± L1, target_z)
+    // nominal pz = target_z + h0，对应目标行走高度在简化模型中的映射值
     for (int i = 0; i < 4; ++i) {
         double s = (cfg.hip_offsets(i, 1) > 0) ? 1.0 : -1.0;  // +1 左腿, -1 右腿
         nominal_foots(i, 0) = cfg.hip_offsets(i, 0);
         nominal_foots(i, 1) = cfg.hip_offsets(i, 1) + s * cfg.L1;
-        nominal_foots(i, 2) = cfg.target_z;
-    }
-
-    // 参考 Python 的 q_cmd = q_abs - q_offset：
-    // IK 返回 FK 坐标系中的绝对角度，发送电机前需减去站立参考角，
-    // 这样 nominal 姿态时 pos_raw = joint_offsets（与 startup 目标一致，无跳变）。
-    Eigen::Matrix<double, 12, 1> q_stand_abs = Eigen::Matrix<double, 12, 1>::Zero();
-    for (int i = 0; i < 4; ++i) {
-        Eigen::Vector3d q_leg;
-        if (kin.ik_foot(i, nominal_foots.row(i).transpose(), q_leg)) {
-            q_stand_abs.segment<3>(i * 3) = q_leg;
-        } else {
-            std::cerr << "[FATAL] IK failed for nominal stand pose leg " << i << std::endl;
-            return 1;
-        }
+        nominal_foots(i, 2) = cfg.target_z + h0;
     }
 
     // 4. 主循环 (500Hz)
     auto next_tick = std::chrono::steady_clock::now();
     std::cout << "[Loop] 进入控制循环，使用左摇杆控制前进/后退速度" << std::endl;
     int loop_count = 0;
+    double vx = 0.0;  // 低通滤波后的速度，防止启动时向后踢腿
 
     while (g_running) {
         next_tick += std::chrono::microseconds(2000);
@@ -172,15 +166,16 @@ int main(int argc, char* argv[]) {
 
         ++loop_count;
 
-        // A. 获取遥控器输入
-        double vx = 0.0;
+        // A. 获取遥控器输入（低通滤波，参考 pd-control-observed-hfield）
+        double vx_cmd = 0.0;
         if (gamepad->IsConnected()) {
-            vx = -gamepad->GetAxis(1) * 0.4; // 最大速度设定为 0.4 m/s
+            vx_cmd = -gamepad->GetAxis(1) * 0.4;
         }
+        vx = 0.95 * vx + 0.05 * vx_cmd;
 
         // 每秒打印一次 vx 和 step_len，用于调试
         if (loop_count % 500 == 0) {
-            double step_len_dbg = vx * gait_period * 0.5;
+            double step_len_dbg = vx * cfg.gait_period * stance_frac;
             std::cout << "[DBG] vx=" << vx << " step_len=" << step_len_dbg
                       << " phases=[" << phases[0] << "," << phases[1]
                       << "," << phases[2] << "," << phases[3] << "]" << std::endl;
@@ -191,28 +186,28 @@ int main(int argc, char* argv[]) {
 
         for (int i = 0; i < 4; ++i) {
             // 更新相位
-            phases[i] += dt / gait_period;
+            phases[i] += dt / cfg.gait_period;
             if (phases[i] > 1.0) phases[i] -= 1.0;
 
             double t = phases[i];
+            // T_stance = gait_period * duty_factor，步长 = vx * T_stance
+            double step_len = vx * cfg.gait_period * stance_frac;
             Eigen::Vector3d foot_p;
 
-            if (t < 0.5) { // 摆动相 (Swing)
-                double swing_t = t / 0.5;
-                double step_len = vx * gait_period * 0.5;
-                
+            if (t < swing_frac) { // 摆动相 (Swing)
+                double swing_t = t / swing_frac;  // 归一化到 [0,1]
+
                 // 计算相对于标定点的摆线偏移
-                Eigen::Vector3d offset = calculate_cycloid(swing_t, step_len, step_height);
-                
-                // 摆动起点应在步长负半轴，终点在正半轴
+                Eigen::Vector3d offset = calculate_cycloid(swing_t, step_len, cfg.step_height);
+
+                // 摆动起点在步长负半轴，终点在正半轴
                 foot_p = nominal_foots.row(i).transpose();
                 foot_p.x() += (offset.x() - step_len * 0.5);
                 foot_p.z() -= offset.z();  // z 正方向朝下，抬脚 = z 减小
-            } 
+            }
             else { // 支撑相 (Stance)
-                double stance_t = (t - 0.5) / 0.5;
-                double step_len = vx * gait_period * 0.5;
-                
+                double stance_t = (t - swing_frac) / stance_frac;  // 归一化到 [0,1]
+
                 // 支撑相足端相对于身体向后平移以推进机器人
                 foot_p = nominal_foots.row(i).transpose();
                 foot_p.x() += (0.5 - stance_t) * step_len;
@@ -226,7 +221,7 @@ int main(int argc, char* argv[]) {
                 // IK 失败则退回到站立姿态，避免崩溃
                 std::cout << "[WARN] IK failed leg " << i
                           << " foot_p=(" << foot_p.x() << "," << foot_p.y() << "," << foot_p.z() << ")" << std::endl;
-                q_des.segment<3>(i * 3) = q_stand_abs.segment<3>(i * 3);  // fallback 到站立角
+                q_des.segment<3>(i * 3) = Eigen::Vector3d::Zero();  // fallback: q=0 → motor=joint_offsets（站立位置）
             }
         }
 
@@ -239,15 +234,14 @@ int main(int argc, char* argv[]) {
             bool is_knee = (mpc_idx % 3 == 2);
             double gear = is_knee ? cfg.knee_gear_ratio : 1.0;
             
-            // 目标角度：减去站立参考角（q_stand_abs），确保 nominal 姿态 → pos_raw = joint_offsets
-            // 对应 Python 的 q_cmd = q_abs - q_offset
-            double pos_raw = (q_des[mpc_idx] - q_stand_abs[mpc_idx]) * gear + offset;
+            // nominal 时 q_des=0 → pos_raw=joint_offsets（与 startup 一致，h0 已在 IK 输入中修正）
+            double pos_raw = q_des[mpc_idx] * gear + offset;
 
             // MIT 模式：摆动腿用 kp_swing，支撑腿用 kp_stance，扭矩前馈填 0
             int leg_i = mpc_idx / 3;
-            bool in_swing = (phases[leg_i] < 0.5);
-            float kp = in_swing ? (float)cfg.kp_swing : (float)cfg.kp_stance;
-            float kd = in_swing ? (float)cfg.mit_kd    : (float)cfg.kd_stance;
+            bool in_swing = (phases[leg_i] < swing_frac);
+            float kp = in_swing ? (float)cfg.kp_swing  : (float)cfg.kp_stance;
+            float kd = in_swing ? (float)cfg.kd_swing  : (float)cfg.kd_stance;
             rs->SendMITCommand(motor_idx, (float)pos_raw, 0.0f, kp, kd, 0.0f);
         }
 

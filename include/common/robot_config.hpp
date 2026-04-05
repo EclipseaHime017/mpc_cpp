@@ -24,6 +24,7 @@ struct RobotConfig {
     Eigen::Matrix<double, 12, 1> stand_joint_angles = Eigen::Matrix<double,12,1>::Zero();
 
     double target_z = 0.2;
+    double z_zero   = 0.23;  // physical stand height at motor=joint_offsets (measured)
 
     // ----- Gait -----
     double gait_period  = 0.4;

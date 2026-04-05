@@ -47,6 +47,7 @@ RobotConfig RobotConfig::from_yaml(const std::string& path) {
         opt_d(rb, "L2",       cfg.L2);
         opt_d(rb, "L3",       cfg.L3);
         opt_d(rb, "target_z", cfg.target_z);
+        opt_d(rb, "z_zero",   cfg.z_zero);
         if (rb["I_body"]) {
             auto v = rb["I_body"].as<std::vector<double>>();
             if (v.size() == 9)

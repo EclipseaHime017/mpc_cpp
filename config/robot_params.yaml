@@ -19,7 +19,8 @@ robot:
   stand_joint_angles: [0.0, 0.0, 0.0, 0.0,
                        0.0, 0.0, 0.0, 0.0,
                        0.0, 0.0, 0.0, 0.0]
-  target_z: 0.2    # desired body height [m]
+  target_z: 0.23   # desired body height [m]，与 z_zero 保持一致避免 startup→gait 跳变
+  z_zero: 0.23     # physical stand height when motor=joint_offsets (measured, z_down from hip)
 
 gait:
   period: 0.4        # [s] full trot cycle
