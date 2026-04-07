@@ -46,9 +46,9 @@ struct RobotConfig {
     double ipopt_tol      = 1e-2;
 
     // ----- Control gains -----
-    double kp_stand  = 100.0, kd_stand  = 2.0;   // calibration phase PD
-    double kp_swing  = 150.0, kd_swing  = 8.0;   // swing leg tracking
-    double kp_stance =  30.0, kd_stance = 2.0;   // stance leg (with WBC tau_ff)
+    double kp_stand  =  40.0, kd_stand  = 2.0;   // calibration phase PD
+    double kp_swing  =  40.0, kd_swing  = 2.0;   // swing leg tracking (KD_MAX=5.0)
+    double kp_stance =  20.0, kd_stance = 1.0;   // stance leg (with WBC tau_ff)
 
     // ----- Hardware -----
     // CAN interface names, one per leg group (LF, LR, RF, RR)

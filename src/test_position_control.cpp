@@ -53,11 +53,17 @@ int main(int argc, char* argv[]) {
     QuadrupedKinematics kin(cfg);
     
     auto rs = std::make_shared<RobstrideController>();
-    auto can0 = std::make_shared<CANInterface>("candle0");
-    auto can1 = std::make_shared<CANInterface>("candle1");
-    auto can2 = std::make_shared<CANInterface>("candle2");
-    auto can3 = std::make_shared<CANInterface>("candle3");
-    rs->BindCAN(can0); rs->BindCAN(can1); rs->BindCAN(can2); rs->BindCAN(can3);
+    if (cfg.can_interfaces.size() < 4) {
+        std::cerr << "[Error] 需要 4 个 CAN 接口，配置中只有 "
+                  << cfg.can_interfaces.size() << " 个" << std::endl;
+        return 1;
+    }
+    std::vector<std::shared_ptr<CANInterface>> can_ifaces;
+    for (int j = 0; j < 4; ++j) {
+        auto iface = std::make_shared<CANInterface>(cfg.can_interfaces[j].c_str());
+        rs->BindCAN(iface);
+        can_ifaces.push_back(iface);
+    }
 
     std::vector<int> motor_indices(12);
     
@@ -121,6 +127,13 @@ int main(int argc, char* argv[]) {
 
             // 从实际当前位置插值到目标，避免第一帧跳变
             double current_pos_raw = start_pos_raw[mpc_idx] * (1.0 - factor) + target_pos_raw * factor;
+            // 起立阶段同样需要 shaft 限幅，防止起始位置异常时超行程
+            // 限位是从电机编码器零点起算（绝对值），转换为 pos_raw 空间：lower = offset + shaft_min
+            {
+                double lower = offset + cfg.joint_shaft_min[gi];
+                double upper = offset + cfg.joint_shaft_max[gi];
+                current_pos_raw = std::max(lower, std::min(upper, current_pos_raw));
+            }
 
             // 给定适当的 PD 参数执行平滑移动 (起立阶段用 kp_stand / kd_stand)
             rs->SendMITCommand(motor_idx, (float)current_pos_raw, 0.0f,
@@ -132,6 +145,11 @@ int main(int argc, char* argv[]) {
     std::cout << "[Init] 起立完成！" << std::endl;
 
     // 准备运动控制参数（从 cfg 读取，避免与 YAML 不一致）
+    if (cfg.duty_factor <= 0.0 || cfg.duty_factor >= 1.0) {
+        std::cerr << "[Error] duty_factor=" << cfg.duty_factor
+                  << " 必须在 (0, 1) 之间" << std::endl;
+        return 1;
+    }
     const double swing_frac  = 1.0 - cfg.duty_factor;  // 摆动相占比
     const double stance_frac = cfg.duty_factor;         // 支撑相占比
 
@@ -219,8 +237,12 @@ int main(int argc, char* argv[]) {
                 q_des.segment<3>(i * 3) = q_leg;
             } else {
                 // IK 失败则退回到站立姿态，避免崩溃
-                std::cout << "[WARN] IK failed leg " << i
-                          << " foot_p=(" << foot_p.x() << "," << foot_p.y() << "," << foot_p.z() << ")" << std::endl;
+                // 限制打印频率，避免 500Hz 循环中 stdout 阻塞引发 timing jitter
+                if (loop_count % 500 == 0) {
+                    std::cout << "[WARN] IK failed leg " << i
+                              << " foot_p=(" << foot_p.x() << "," << foot_p.y()
+                              << "," << foot_p.z() << ")" << std::endl;
+                }
                 q_des.segment<3>(i * 3) = Eigen::Vector3d::Zero();  // fallback: q=0 → motor=joint_offsets（站立位置）
             }
         }
@@ -234,12 +256,14 @@ int main(int argc, char* argv[]) {
             bool is_knee = (mpc_idx % 3 == 2);
             double gear = is_knee ? cfg.knee_gear_ratio : 1.0;
 
-            // nominal 时 q_des=0 → pos_raw=joint_offsets（与 startup 一致，h0 已在 IK 输入中修正）
+            // pos_raw = q_des * gear + joint_offset（绝对编码器目标）
+            // 限位在 pos_raw 绝对空间：lower = joint_offset + shaft_min
             double pos_raw = q_des[mpc_idx] * gear + offset;
-
-            // shaft 空间限幅（pos_raw），与 main.cpp JOINT_SHAFT_MIN/MAX 一致
-            // 在 shaft 空间限幅可正确处理左右腿 offset 正负相反的情况
-            pos_raw = std::max(cfg.joint_shaft_min[gi], std::min(cfg.joint_shaft_max[gi], pos_raw));
+            {
+                double lower = offset + cfg.joint_shaft_min[gi];
+                double upper = offset + cfg.joint_shaft_max[gi];
+                pos_raw = std::max(lower, std::min(upper, pos_raw));
+            }
 
             // MIT 模式：摆动腿用 kp_swing，支撑腿用 kp_stance，扭矩前馈填 0
             int leg_i = mpc_idx / 3;
@@ -252,7 +276,37 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_until(next_tick);
     }
 
-    // 5. 关机
-    std::cout << "\n[Shutdown] 完成。" << std::endl;
+    // 5. 关机：先让腿回到站立位置，再关闭电机（再次 Ctrl+C 可跳过结算直接断电）
+    std::cout << "\n[Shutdown] 回到站立位置..." << std::endl;
+    g_running = true;  // 复用信号标志，允许二次 Ctrl+C 跳过结算
+    std::signal(SIGINT, signal_handler);
+    for (unsigned int step = 1; step <= 500 && g_running; ++step) {
+        float factor = (float)step / 500.0f;
+        for (int mpc_idx = 0; mpc_idx < 12; ++mpc_idx) {
+            int gi = MPC_TO_MOTOR_IDX[mpc_idx];
+            int motor_idx = motor_indices[gi];
+            double offset = cfg.joint_offsets[gi];
+            bool is_knee = (mpc_idx % 3 == 2);
+            double gear = is_knee ? cfg.knee_gear_ratio : 1.0;
+            double stand_pos_raw = cfg.stand_joint_angles[mpc_idx] * gear + offset;
+            double cur = rs->GetMotorState(motor_idx).position;
+            double target = cur * (1.0 - factor) + stand_pos_raw * factor;
+            {
+                double lower = offset + cfg.joint_shaft_min[gi];
+                double upper = offset + cfg.joint_shaft_max[gi];
+                target = std::max(lower, std::min(upper, target));
+            }
+            rs->SendMITCommand(motor_idx, (float)target, 0.0f,
+                               (float)cfg.kp_stand, (float)cfg.kd_stand, 0.0f);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    std::cout << "[Shutdown] 关闭电机..." << std::endl;
+    for (int mpc_idx = 0; mpc_idx < 12; ++mpc_idx) {
+        int gi = MPC_TO_MOTOR_IDX[mpc_idx];
+        rs->DisableMotor(motor_indices[gi]);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    std::cout << "[Shutdown] 完成。" << std::endl;
     return 0;
 }
