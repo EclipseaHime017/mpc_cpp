@@ -25,28 +25,39 @@ static void signal_handler(int) { g_running = false; }
 static const int MPC_TO_MOTOR_IDX[12] = {0,4,8, 1,5,9, 2,6,10, 3,7,11};
 
 /**
- * 摆线轨迹计算函数（支持 x / y 双轴步长）
- * @param t          归一化相位 [0, 1]（摆动相内）
- * @param step_len   x 方向步长 (m)
- * @param step_len_y y 方向步长 (m)
- * @param step_height 抬腿高度 (m)，实际峰值 = step_height（z 峰值）
+ * 电机方向符号
+ *
+ * HipF/Knee: 左腿 +1，右腿 -1（安装方向相反）
+ * HipA:      棋盘格对称安装，LF/RR = +1，LR/RF = -1
+ *            （前后腿 HipA 电机朝向相反，因此需要交叉取符号）
+ *
+ * 对正/反向行走不影响（行走时 delta_q_HipA ≈ 0）；
+ * 横向平移时 delta_q_HipA ≠ 0，需要正确符号才能同向侧移。
+ */
+static double motor_dir(int leg_i, int joint_type) {
+    if (joint_type == 1 || joint_type == 2) {        // HipF / Knee
+        return (leg_i >= 2) ? -1.0 : 1.0;            // RF/RR = -1, LF/LR = +1
+    }
+    // HipA: LF(0)/RR(3) = +1,  LR(1)/RF(2) = -1
+    return (leg_i == 0 || leg_i == 3) ? 1.0 : -1.0;
+}
+
+/**
+ * 摆线轨迹（双轴：x 前后，y 横向，z 抬腿）
+ * 峰值高度 = step_height（z 最大值）
  */
 static Eigen::Vector3d calculate_cycloid(double t,
-                                          double step_len,
-                                          double step_len_y,
+                                          double sx, double sy,
                                           double step_height) {
-    // 摆线方程: x = L * (t - 1/(2pi) * sin(2pi*t))
     auto cyc = [](double t_in, double len) {
         return len * (t_in - (1.0 / (2.0 * M_PI)) * std::sin(2.0 * M_PI * t_in));
     };
-    double x = cyc(t, step_len);
-    double y = cyc(t, step_len_y);
     double z = 0.0;
     if (t < 0.5)
         z = step_height * (2.0 * t - (1.0 / (2.0 * M_PI)) * std::sin(4.0 * M_PI * t));
     else
         z = step_height * (2.0 * (1.0 - t) - (1.0 / (2.0 * M_PI)) * std::sin(4.0 * M_PI * (1.0 - t)));
-    return Eigen::Vector3d(x, y, z);
+    return Eigen::Vector3d(cyc(t, sx), cyc(t, sy), z);
 }
 
 int main(int argc, char* argv[]) {
@@ -73,7 +84,6 @@ int main(int argc, char* argv[]) {
     std::vector<int> motor_indices(12);
 
     std::cout << "[Init] 开始唤醒并初始化电机..." << std::endl;
-    // 2. 绑定电机并稳健唤醒
     for (int j = 0; j < 4; ++j) {
         for (int i = 0; i < 3; ++i) {
             int global_idx = j + i * 4;
@@ -83,7 +93,6 @@ int main(int argc, char* argv[]) {
             int idx = rs->BindMotor(cfg.can_interfaces[j].c_str(), std::move(minfo));
             motor_indices[global_idx] = idx;
 
-            // 启用电机与自动反馈，加入延时确保 CAN 总线不丢包
             rs->EnableMotor(idx);
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             rs->EnableAutoReport(idx);
@@ -91,7 +100,6 @@ int main(int argc, char* argv[]) {
             rs->EnableAutoReport(idx);
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
-            // 设置默认的 MIT 模式参数和限幅
             rs->SetMITParams(idx, {(float)cfg.mit_kp, (float)cfg.mit_kd,
                                    (float)cfg.mit_vel_limit, (float)cfg.mit_torque_limit});
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -102,43 +110,27 @@ int main(int argc, char* argv[]) {
     std::cout << "[Init] 等待系统就绪..." << std::endl;
     std::this_thread::sleep_for(std::chrono::seconds(1));
 
-    // 3. 初始标定与平滑起立动作 (当前位置 -> 站立)
-    std::cout << "[Init] 执行起立动作 (当前位置 -> 站立)..." << std::endl;
+    // 2. 平滑起立 (当前位置 → 站立, 2 秒)
+    std::cout << "[Init] 执行起立动作..." << std::endl;
 
-    // 读取各关节当前位置作为插值起点，避免第一帧突变
     std::vector<double> start_pos_raw(12);
     for (int mpc_idx = 0; mpc_idx < 12; ++mpc_idx) {
         int gi = MPC_TO_MOTOR_IDX[mpc_idx];
-        int motor_idx = motor_indices[gi];
-        start_pos_raw[mpc_idx] = rs->GetMotorState(motor_idx).position;
+        start_pos_raw[mpc_idx] = rs->GetMotorState(motor_indices[gi]).position;
     }
-
-    // 用 2 秒钟（1000个2ms的步长）从当前位置插值到目标站立角度
-    unsigned int startup_interval = 1000;
-    for (unsigned int step = 1; step <= startup_interval; ++step) {
+    for (unsigned int step = 1; step <= 1000; ++step) {
         if (!g_running) break;
-        float factor = (float)step / (float)startup_interval;
-
+        float factor = (float)step / 1000.0f;
         for (int mpc_idx = 0; mpc_idx < 12; ++mpc_idx) {
-            int gi = MPC_TO_MOTOR_IDX[mpc_idx];
-            int motor_idx = motor_indices[gi];
-            double offset = cfg.joint_offsets[gi];
-
+            int gi     = MPC_TO_MOTOR_IDX[mpc_idx];
+            double off = cfg.joint_offsets[gi];
             bool is_knee = (mpc_idx % 3 == 2);
-            double gear = is_knee ? cfg.knee_gear_ratio : 1.0;
-
-            // 目标站立角度的物理绝对位置
-            double target_pos_raw = cfg.stand_joint_angles[mpc_idx] * gear + offset;
-
-            // 从实际当前位置插值到目标，避免第一帧跳变
-            double current_pos_raw = start_pos_raw[mpc_idx] * (1.0 - factor) + target_pos_raw * factor;
-            {
-                double lower = offset + cfg.joint_shaft_min[gi];
-                double upper = offset + cfg.joint_shaft_max[gi];
-                current_pos_raw = std::max(lower, std::min(upper, current_pos_raw));
-            }
-
-            rs->SendMITCommand(motor_idx, (float)current_pos_raw, 0.0f,
+            double gear  = is_knee ? cfg.knee_gear_ratio : 1.0;
+            double target = cfg.stand_joint_angles[mpc_idx] * gear + off;
+            double cur = start_pos_raw[mpc_idx] * (1.0 - factor) + target * factor;
+            cur = std::max(off + cfg.joint_shaft_min[gi],
+                  std::min(off + cfg.joint_shaft_max[gi], cur));
+            rs->SendMITCommand(motor_indices[gi], (float)cur, 0.0f,
                                (float)cfg.kp_stand, (float)cfg.kd_stand, 0.0f);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -146,8 +138,7 @@ int main(int argc, char* argv[]) {
     std::cout << "[Init] 起立完成！" << std::endl;
 
     if (cfg.duty_factor <= 0.0 || cfg.duty_factor >= 1.0) {
-        std::cerr << "[Error] duty_factor=" << cfg.duty_factor
-                  << " 必须在 (0, 1) 之间" << std::endl;
+        std::cerr << "[Error] duty_factor 必须在 (0,1)" << std::endl;
         return 1;
     }
     const double swing_frac  = 1.0 - cfg.duty_factor;
@@ -155,78 +146,102 @@ int main(int argc, char* argv[]) {
 
     double phases[4];
     for (int i = 0; i < 4; ++i) phases[i] = cfg.phase_offsets[i];
-    Eigen::Matrix<double, 4, 3> nominal_foots;
 
+    Eigen::Matrix<double, 4, 3> nominal_foots;
     for (int i = 0; i < 4; ++i) {
         double s = (cfg.hip_offsets(i, 1) > 0) ? 1.0 : -1.0;
         nominal_foots(i, 0) = cfg.hip_offsets(i, 0);
         nominal_foots(i, 1) = cfg.hip_offsets(i, 1) + s * cfg.L1;
-        // 直接让 IK 在真实的 target_z 处求解
         nominal_foots(i, 2) = cfg.target_z;
     }
 
-    // 预计算站立 IK 角度，用于 delta_q 方式驱动电机
+    // 预计算站立 IK 角度（用于 delta_q 方式驱动电机）
     Eigen::Matrix<double, 12, 1> q_stand = Eigen::Matrix<double, 12, 1>::Zero();
     for (int i = 0; i < 4; ++i) {
         Eigen::Vector3d q_leg;
-        if (kin.ik_foot(i, nominal_foots.row(i).transpose(), q_leg)) {
-            q_stand.segment<3>(i * 3) = q_leg;
-        } else {
-            std::cerr << "[Error] 站立 IK 失败，腿 " << i << " 无法求解" << std::endl;
+        if (!kin.ik_foot(i, nominal_foots.row(i).transpose(), q_leg)) {
+            std::cerr << "[Error] 站立 IK 失败，腿 " << i << std::endl;
             return 1;
         }
+        q_stand.segment<3>(i * 3) = q_leg;
     }
-    std::cout << "[Init] 计算出站立 IK 角度完成" << std::endl;
+    std::cout << "[Init] 站立 IK 完成" << std::endl;
 
     // -------------------------------------------------------------------------
-    // 遥控器参数
-    // -------------------------------------------------------------------------
-    constexpr double DEADZONE   = 0.05;   // 摇杆死区（归一化，0~1）
-    constexpr double MAX_VX     = 1.0;    // 前后最大速度 (m/s)
-    constexpr double MAX_VY     = 0.4;    // 横向最大速度 (m/s)
-    constexpr double MAX_WZ     = 0.8;    // 偏航最大速率 (rad/s)
-    constexpr double HALF_TRACK = 0.135;  // 左右足横向半距 (m)，用于差速转向
+    // 遥控器轴映射（Xbox 360 / XInput 布局）：
+    //   axis 0 = 左摇杆 X   axis 1 = 左摇杆 Y
+    //   axis 3 = 右摇杆 X   axis 4 = 右摇杆 Y
+    // PS4/DualShock：右摇杆 X = axis 2，需改下方 AX_YAW
+    constexpr int  AX_LATERAL = 0;   // 左摇杆 X → 横向平移
+    constexpr int  AX_FWD     = 1;   // 左摇杆 Y → 前后
+    constexpr int  AX_YAW     = 3;   // 右摇杆 X → 偏航（Xbox=3, PS4=2）
 
-    // 4. 主循环 (500Hz)
+    constexpr double DEADZONE    = 0.05;   // 摇杆死区（归一化轴值）
+    constexpr double MAX_VX      = 1.0;    // 前后最大速度 (m/s)
+    constexpr double MAX_VY      = 0.4;    // 横向最大速度 (m/s)
+    constexpr double MAX_WZ      = 0.8;    // 偏航最大速率 (rad/s)
+    constexpr double HALF_TRACK  = 0.135;  // 左右足横向半距 (m)
+
+    // 静止模式需要连续 N 帧检测到零输入，防止单帧噪声触发冻结
+    constexpr int   STAND_HYSTERESIS = 50; // 50 帧 = 0.1 s
+    int stand_count = 0;       // 连续零输入帧数
+    bool in_stand_mode = false;
+
+    // -------------------------------------------------------------------------
+    // 3. 主循环 (500 Hz)
+    // -------------------------------------------------------------------------
     auto next_tick = std::chrono::steady_clock::now();
     std::cout << "[Loop] 进入控制循环" << std::endl;
-    std::cout << "  左摇杆 Y=前后  X=横向平移;  右摇杆 X=偏航转向" << std::endl;
+    std::cout << "  左 Y=前后  左 X=横向平移  右 X=偏航转向  死区=" << DEADZONE << std::endl;
+
     int loop_count = 0;
     double vx = 0.0, vy = 0.0, wz = 0.0;
 
     while (g_running) {
         next_tick += std::chrono::microseconds(2000);
-        double dt = 0.002;
-        ++loop_count;
 
-        // A. 读取遥控器，应用死区，低通滤波
-        double vx_cmd = 0.0, vy_cmd = 0.0, wz_cmd = 0.0;
-        if (gamepad->IsConnected()) {
-            double ax0 = gamepad->GetAxis(0);  // 左摇杆 X（横向）
-            double ax1 = gamepad->GetAxis(1);  // 左摇杆 Y（前后）
-            double ax2 = gamepad->GetAxis(2);  // 右摇杆 X（偏航）
-            if (std::abs(ax0) > DEADZONE) vy_cmd = -ax0 * MAX_VY;
-            if (std::abs(ax1) > DEADZONE) vx_cmd = -ax1 * MAX_VX;
-            if (std::abs(ax2) > DEADZONE) wz_cmd = -ax2 * MAX_WZ;
+        // 防止计时器积累过多欠时（例如系统负载高时），避免死循环空转
+        {
+            auto now = std::chrono::steady_clock::now();
+            if (next_tick < now - std::chrono::milliseconds(20))
+                next_tick = now;
         }
-        vx = 0.95 * vx + 0.05 * vx_cmd;
-        vy = 0.95 * vy + 0.05 * vy_cmd;
-        wz = 0.95 * wz + 0.05 * wz_cmd;
 
-        // 判断是否处于静止死区（滤波后速度足够小）
-        const bool standing = (std::abs(vx) < 0.01 &&
-                                std::abs(vy) < 0.01 &&
-                                std::abs(wz) < 0.01);
+        ++loop_count;
+        const double dt = 0.002;
+
+        // A. 读取遥控器，应用死区（直接使用，不做低通滤波）
+        //    只有手柄真正连接时才读取输入；断连则输入清零（不进入静止模式）
+        bool gamepad_connected = gamepad->IsConnected();
+        vx = 0.0; vy = 0.0; wz = 0.0;
+        if (gamepad_connected) {
+            double ax_fwd = gamepad->GetAxis(AX_FWD);
+            double ax_lat = gamepad->GetAxis(AX_LATERAL);
+            double ax_yaw = gamepad->GetAxis(AX_YAW);
+            if (std::abs(ax_fwd) > DEADZONE) vx = -ax_fwd * MAX_VX;
+            if (std::abs(ax_lat) > DEADZONE) vy = -ax_lat * MAX_VY;
+            if (std::abs(ax_yaw) > DEADZONE) wz = -ax_yaw * MAX_WZ;
+        }
+
+        // B. 静止模式判断（迟滞：需连续 STAND_HYSTERESIS 帧零输入）
+        //    gamepad 断连时不进入静止模式，避免意外冻结
+        bool all_zero = (vx == 0.0 && vy == 0.0 && wz == 0.0 && gamepad_connected);
+        if (all_zero) {
+            if (stand_count < STAND_HYSTERESIS) ++stand_count;
+        } else {
+            stand_count = 0;
+        }
+        in_stand_mode = (stand_count >= STAND_HYSTERESIS);
 
         if (loop_count % 500 == 0) {
             std::cout << "[DBG] vx=" << vx << " vy=" << vy << " wz=" << wz
-                      << " standing=" << standing
+                      << " stand=" << in_stand_mode
                       << " phases=[" << phases[0] << "," << phases[1]
                       << "," << phases[2] << "," << phases[3] << "]" << std::endl;
         }
 
-        // B. 静止模式：保持站立姿态，发送 offset，不推进相位
-        if (standing) {
+        // C. 静止模式：保持 offset 位置，相位不推进
+        if (in_stand_mode) {
             for (int mpc_idx = 0; mpc_idx < 12; ++mpc_idx) {
                 int gi = MPC_TO_MOTOR_IDX[mpc_idx];
                 rs->SendMITCommand(motor_indices[gi],
@@ -237,29 +252,27 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        // C. 差速转向：左右腿 x 步长不同；横向：所有腿 y 步长相同
-        //    wz > 0 = 逆时针（向左转），左腿后踏，右腿前踏
-        //    side: 左腿 +1，右腿 -1
+        // D. 差速转向 + 横向步长
+        //    wz > 0 = 逆时针（向左转）：左腿步长减小，右腿步长增大
+        //    vy > 0 = 向左平移（+y 方向为左侧）
         const double T_stance = cfg.gait_period * stance_frac;
         double leg_step_x[4], leg_step_y[4];
         for (int i = 0; i < 4; ++i) {
-            double side = (cfg.hip_offsets(i, 1) > 0) ? 1.0 : -1.0;
+            double side = (cfg.hip_offsets(i, 1) > 0) ? 1.0 : -1.0;  // 左=+1, 右=-1
             leg_step_x[i] = (vx - side * wz * HALF_TRACK) * T_stance;
             leg_step_y[i] = vy * T_stance;
         }
 
-        // D. 计算每个腿的目标关节角
-        Eigen::Matrix<double, 12, 1> q_des = Eigen::Matrix<double, 12, 1>::Zero();
-
+        // E. IK 求解
+        Eigen::Matrix<double, 12, 1> q_des = q_stand;  // 默认保持站立角度
         for (int i = 0; i < 4; ++i) {
-            // 更新相位
             phases[i] += dt / cfg.gait_period;
             if (phases[i] > 1.0) phases[i] -= 1.0;
 
             double t = phases[i];
             Eigen::Vector3d foot_p;
 
-            if (t < swing_frac) { // 摆动相 (Swing)
+            if (t < swing_frac) {
                 double swing_t = t / swing_frac;
                 Eigen::Vector3d cyc = calculate_cycloid(swing_t,
                                                          leg_step_x[i], leg_step_y[i],
@@ -267,97 +280,79 @@ int main(int argc, char* argv[]) {
                 foot_p = nominal_foots.row(i).transpose();
                 foot_p.x() += cyc.x() - leg_step_x[i] * 0.5;
                 foot_p.y() += cyc.y() - leg_step_y[i] * 0.5;
-                foot_p.z() -= cyc.z();  // z 正方向朝下，抬脚 = z 减小
-            }
-            else { // 支撑相 (Stance)
+                foot_p.z() -= cyc.z();
+            } else {
                 double stance_t = (t - swing_frac) / stance_frac;
                 foot_p = nominal_foots.row(i).transpose();
                 foot_p.x() += (0.5 - stance_t) * leg_step_x[i];
                 foot_p.y() += (0.5 - stance_t) * leg_step_y[i];
             }
 
-            // 逆运动学求解
             Eigen::Vector3d q_leg;
             if (kin.ik_foot(i, foot_p, q_leg)) {
                 q_des.segment<3>(i * 3) = q_leg;
-            } else {
-                if (loop_count % 500 == 0)
-                    std::cout << "[WARN] IK failed leg " << i
-                              << " foot_p=(" << foot_p.x() << "," << foot_p.y()
-                              << "," << foot_p.z() << ")" << std::endl;
-                q_des.segment<3>(i * 3) = q_stand.segment<3>(i * 3);  // fallback: 保持站立
+            } else if (loop_count % 500 == 0) {
+                std::cout << "[WARN] IK failed leg " << i
+                          << " p=(" << foot_p.x() << "," << foot_p.y()
+                          << "," << foot_p.z() << ")" << std::endl;
             }
         }
 
-        // E. 发送电机指令
+        // F. 发送电机指令
         for (int mpc_idx = 0; mpc_idx < 12; ++mpc_idx) {
-            int gi = MPC_TO_MOTOR_IDX[mpc_idx];
-            int motor_idx = motor_indices[gi];
-            double offset = cfg.joint_offsets[gi];
-
-            bool is_knee = (mpc_idx % 3 == 2);
-            double gear = is_knee ? cfg.knee_gear_ratio : 1.0;
-
-            // 右侧腿 (RF, RR) 的 HipF/Knee 电机安装方向与左侧相反
-            int leg_i = mpc_idx / 3;
+            int gi         = MPC_TO_MOTOR_IDX[mpc_idx];
+            double off     = cfg.joint_offsets[gi];
+            int leg_i      = mpc_idx / 3;
             int joint_type = mpc_idx % 3;
-            double motor_dir = ((leg_i == 2 || leg_i == 3) && (joint_type == 1 || joint_type == 2))
-                               ? -1.0 : 1.0;
+            bool is_knee   = (joint_type == 2);
+            double gear    = is_knee ? cfg.knee_gear_ratio : 1.0;
+            double mdir    = motor_dir(leg_i, joint_type);
 
             double delta_q = q_des[mpc_idx] - q_stand[mpc_idx];
-            double pos_raw = delta_q * gear * motor_dir + offset;
+            double pos_raw = delta_q * gear * mdir + off;
             {
-                double lower = offset + cfg.joint_shaft_min[gi];
-                double upper = offset + cfg.joint_shaft_max[gi];
-                if (pos_raw < lower || pos_raw > upper) {
-                    if (loop_count % 100 == 0)
-                        std::cout << "[WARN] Leg " << leg_i << " Joint " << joint_type
-                                  << " 超限! pos_raw=" << pos_raw
-                                  << " 限位=[" << lower << "," << upper << "]" << std::endl;
-                }
-                pos_raw = std::max(lower, std::min(upper, pos_raw));
+                double lo = off + cfg.joint_shaft_min[gi];
+                double hi = off + cfg.joint_shaft_max[gi];
+                if ((pos_raw < lo || pos_raw > hi) && loop_count % 100 == 0)
+                    std::cout << "[WARN] L" << leg_i << "J" << joint_type
+                              << " 超限 pos=" << pos_raw
+                              << " [" << lo << "," << hi << "]" << std::endl;
+                pos_raw = std::max(lo, std::min(hi, pos_raw));
             }
 
             bool in_swing = (phases[leg_i] < swing_frac);
             float kp = in_swing ? (float)cfg.kp_swing  : (float)cfg.kp_stance;
             float kd = in_swing ? (float)cfg.kd_swing  : (float)cfg.kd_stance;
-            rs->SendMITCommand(motor_idx, (float)pos_raw, 0.0f, kp, kd, 0.0f);
+            rs->SendMITCommand(motor_indices[gi], (float)pos_raw, 0.0f, kp, kd, 0.0f);
         }
 
         std::this_thread::sleep_until(next_tick);
     }
 
-    // 5. 关机：先让腿回到站立位置，再关闭电机（再次 Ctrl+C 可跳过结算直接断电）
+    // 4. 关机：平滑回到站立，再断电（二次 Ctrl+C 跳过）
     std::cout << "\n[Shutdown] 回到站立位置..." << std::endl;
     g_running = true;
     std::signal(SIGINT, signal_handler);
     for (unsigned int step = 1; step <= 500 && g_running; ++step) {
         float factor = (float)step / 500.0f;
         for (int mpc_idx = 0; mpc_idx < 12; ++mpc_idx) {
-            int gi = MPC_TO_MOTOR_IDX[mpc_idx];
-            int motor_idx = motor_indices[gi];
-            double offset = cfg.joint_offsets[gi];
+            int gi   = MPC_TO_MOTOR_IDX[mpc_idx];
+            double off = cfg.joint_offsets[gi];
             bool is_knee = (mpc_idx % 3 == 2);
-            double gear = is_knee ? cfg.knee_gear_ratio : 1.0;
-            double stand_pos_raw = cfg.stand_joint_angles[mpc_idx] * gear + offset;
-            double cur = rs->GetMotorState(motor_idx).position;
-            double target = cur * (1.0 - factor) + stand_pos_raw * factor;
-            {
-                double lower = offset + cfg.joint_shaft_min[gi];
-                double upper = offset + cfg.joint_shaft_max[gi];
-                target = std::max(lower, std::min(upper, target));
-            }
-            rs->SendMITCommand(motor_idx, (float)target, 0.0f,
+            double gear  = is_knee ? cfg.knee_gear_ratio : 1.0;
+            double stand = cfg.stand_joint_angles[mpc_idx] * gear + off;
+            double cur   = rs->GetMotorState(motor_indices[gi]).position;
+            double tgt   = cur * (1.0 - factor) + stand * factor;
+            tgt = std::max(off + cfg.joint_shaft_min[gi],
+                  std::min(off + cfg.joint_shaft_max[gi], tgt));
+            rs->SendMITCommand(motor_indices[gi], (float)tgt, 0.0f,
                                (float)cfg.kp_stand, (float)cfg.kd_stand, 0.0f);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
     std::cout << "[Shutdown] 关闭电机..." << std::endl;
-    for (int mpc_idx = 0; mpc_idx < 12; ++mpc_idx) {
-        int gi = MPC_TO_MOTOR_IDX[mpc_idx];
-        rs->DisableMotor(motor_indices[gi]);
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
+    for (int mpc_idx = 0; mpc_idx < 12; ++mpc_idx)
+        rs->DisableMotor(motor_indices[MPC_TO_MOTOR_IDX[mpc_idx]]);
     std::cout << "[Shutdown] 完成。" << std::endl;
     return 0;
 }
