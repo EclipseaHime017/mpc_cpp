@@ -117,8 +117,8 @@ int CANInterface::SendMessage(const struct can_frame* frame) {
     
     int nbytes = write(can_socket, frame, sizeof(struct can_frame));
     if (nbytes != sizeof(struct can_frame)) {
-        // EAGAIN means TX queue full (bus-off / no ACK) — skip this frame silently.
-        if (errno != EAGAIN && errno != EWOULDBLOCK)
+        // EAGAIN/EWOULDBLOCK/ENOBUFS: TX queue full (bus-off or no ACK) — skip silently.
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOBUFS)
             perror("CAN write");
         return -1;
     }
