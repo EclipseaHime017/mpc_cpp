@@ -107,8 +107,25 @@ int main(int argc, char* argv[]) {
     }
 
     auto gamepad = std::make_shared<Gamepad>(cfg.gamepad_dev.c_str());
+    // 等待所有电机回传第一帧反馈，最多 5 秒
     std::cout << "[Init] 等待系统就绪..." << std::endl;
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (g_running && std::chrono::steady_clock::now() < deadline) {
+            bool all_online = true;
+            for (int i = 0; i < 12; ++i) {
+                if (!rs->IsMotorOnline(motor_indices[i])) { all_online = false; break; }
+            }
+            if (all_online) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        // 检查是否真的全部上线
+        int online_count = 0;
+        for (int i = 0; i < 12; ++i)
+            if (rs->IsMotorOnline(motor_indices[i])) ++online_count;
+        if (online_count < 12)
+            std::cerr << "[Init] 警告: 只有 " << online_count << "/12 个电机上线\n";
+    }
 
     // 2. 平滑起立 (当前位置 → 站立, 2 秒)
     std::cout << "[Init] 执行起立动作..." << std::endl;

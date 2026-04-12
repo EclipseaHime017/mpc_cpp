@@ -296,6 +296,14 @@ int RobstrideController::EnableMotor(int motor_idx) {
     return -1;
 }
 
+bool RobstrideController::IsMotorOnline(int motor_idx) {
+    std::lock_guard<std::recursive_mutex> lock(motor_data_mutex);
+    if (motor_idx >= 0 && (size_t)motor_idx < motor_data.size()) {
+        return motor_data[motor_idx].online;
+    }
+    return false;
+}
+
 int RobstrideController::DisableMotor(int motor_idx) {
     std::lock_guard<std::recursive_mutex> lock(motor_data_mutex);
     if (motor_idx >= 0 && (size_t)motor_idx < motor_data.size()) {

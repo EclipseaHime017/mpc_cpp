@@ -44,6 +44,7 @@ public:
                        float kp = -1.0f, float kd = -1.0f, float tau_ff = 0.0f);
     int EnableMotor(int motor_idx);
     int DisableMotor(int motor_idx);
+    bool IsMotorOnline(int motor_idx);
     int EnableAutoReport(int motor_idx);
     int DisableAutoReport(int motor_idx);
     int SetZero(int motor_idx);
