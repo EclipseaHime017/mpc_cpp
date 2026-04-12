@@ -6,7 +6,7 @@
 //   30Hz  MPC thread - NMPC footstep planning (non-realtime)
 //
 // Hardware:
-//   Motors: Robstride via 4x CAN interfaces (candle0..3), MIT mode
+//   Motors: Robstride via 4x CAN interfaces (can0..3), MIT mode
 //   IMU:    WIT-Motion via serial (/dev/ttyCH341USB0)
 //   Input:  Linux joystick (/dev/input/js0) or keyboard
 //
@@ -431,11 +431,12 @@ int main(int argc, char* argv[]) {
 
     // ===== Hardware initialization =====
     auto rs = std::make_shared<RobstrideController>();
-    auto can0 = std::make_shared<CANInterface>("candle0");
-    auto can1 = std::make_shared<CANInterface>("candle1");
-    auto can2 = std::make_shared<CANInterface>("candle2");
-    auto can3 = std::make_shared<CANInterface>("candle3");
-    rs->BindCAN(can0); rs->BindCAN(can1); rs->BindCAN(can2); rs->BindCAN(can3);
+    std::vector<std::shared_ptr<CANInterface>> can_ifaces;
+    for (const auto& if_name : cfg.can_interfaces) {
+        auto iface = std::make_shared<CANInterface>(if_name.c_str());
+        can_ifaces.push_back(iface);
+        rs->BindCAN(iface);
+    }
 
     std::vector<int> motor_indices(12);
     startup_motors(rs, motor_indices, cfg);

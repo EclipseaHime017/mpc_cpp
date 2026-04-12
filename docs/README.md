@@ -316,7 +316,7 @@ sudo ./build/mpc_robot_control config/robot_params.yaml
 
 ## 硬件接线说明
 
-- **CAN**：4 路 `candle0`--`candle3`，各接 3 个电机（HipA/HipF/Knee）
+- **CAN**：4 路 `can0`--`can3`，各接 3 个电机（HipA/HipF/Knee）
 - **电机 ID**：HipA=[1,5,9,13]，HipF=[2,6,10,14]，Knee=[3,7,11,15]
 - **IMU**：`/dev/ttyCH341USB0`，波特率自动扫描
 - **手柄**：`/dev/input/js0`（可选）

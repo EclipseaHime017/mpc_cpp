@@ -150,12 +150,12 @@ cmake --build build -j$(nproc)
 
 ```bash
 # [Jetson]
-sudo ip link set candle0 up type can bitrate 1000000
-sudo ip link set candle1 up type can bitrate 1000000
-sudo ip link set candle2 up type can bitrate 1000000
-sudo ip link set candle3 up type can bitrate 1000000
+sudo ip link set can0 up type can bitrate 1000000
+sudo ip link set can1 up type can bitrate 1000000
+sudo ip link set can2 up type can bitrate 1000000
+sudo ip link set can3 up type can bitrate 1000000
 
-candump candle0   # 监听帧
+candump can0   # 监听帧
 ```
 
 **预期**：电机上电后每 1–2ms 收到一帧，ID 对应 `{1,5,9,13}`。
@@ -196,18 +196,18 @@ sudo ./build/test_single_joint all                # 读取全部 12 个电机位
 
 | mpc_index | 关节 | CAN 总线 | Motor ID |
 |-----------|------|---------|----------|
-| 0 | LF_HipA | candle0 | 1 |
-| 1 | LF_HipF | candle0 | 2 |
-| 2 | LF_Knee | candle0 | 3 |
-| 3 | LR_HipA | candle1 | 5 |
-| 4 | LR_HipF | candle1 | 6 |
-| 5 | LR_Knee | candle1 | 7 |
-| 6 | RF_HipA | candle2 | 9 |
-| 7 | RF_HipF | candle2 | 10 |
-| 8 | RF_Knee | candle2 | 11 |
-| 9 | RR_HipA | candle3 | 13 |
-| 10 | RR_HipF | candle3 | 14 |
-| 11 | RR_Knee | candle3 | 15 |
+| 0 | LF_HipA | can0 | 1 |
+| 1 | LF_HipF | can0 | 2 |
+| 2 | LF_Knee | can0 | 3 |
+| 3 | LR_HipA | can1 | 5 |
+| 4 | LR_HipF | can1 | 6 |
+| 5 | LR_Knee | can1 | 7 |
+| 6 | RF_HipA | can2 | 9 |
+| 7 | RF_HipF | can2 | 10 |
+| 8 | RF_Knee | can2 | 11 |
+| 9 | RR_HipA | can3 | 13 |
+| 10 | RR_HipF | can3 | 14 |
+| 11 | RR_Knee | can3 | 15 |
 
 **测试流程**（每个关节独立执行）：
 
@@ -596,7 +596,7 @@ isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3
 |------|-----------|---------|
 | `cmake` 报 `casadi::casadi not found` | CasADi 未导出 CMake target | `find /usr/local/lib -name "libcasadi*"` 确认安装，`rm -rf build` 后重新 cmake |
 | `undefined reference to NMPCFootstepPlanner` | `nmpc_footstep.cpp` 未加入 sources | 已修复，`git pull` 后重新编译 |
-| 电机不动 | CAN ID 不匹配 | `candump candle0` 对比 `motor_ids` |
+| 电机不动 | CAN ID 不匹配 | `candump can0` 对比 `motor_ids` |
 | 站立时腿方向反 | 关节符号错误 | 单关节测试，逐一对照验证表 |
 | 站立时身体倾斜 | `joint_offsets` 不准 | 重新标定零偏 |
 | IMU 重力方向错 | `R_imu2body` 错误 | 静止时打印 rpy，调整旋转矩阵 |

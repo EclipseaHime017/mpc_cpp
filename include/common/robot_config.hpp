@@ -52,7 +52,7 @@ struct RobotConfig {
 
     // ----- Hardware -----
     // CAN interface names, one per leg group (LF, LR, RF, RR)
-    std::vector<std::string> can_interfaces{"candle0","candle1","candle2","candle3"};
+    std::vector<std::string> can_interfaces{"can0","can1","can2","can3"};
     std::string imu_device  = "/dev/ttyCH341USB0";
     std::string gamepad_dev = "/dev/input/js0";
 

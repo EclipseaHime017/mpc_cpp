@@ -39,12 +39,12 @@ static void sig_handler(int) { g_running = false; }
 // motor_indices order: [LF_HipA,LR_HipA,RF_HipA,RR_HipA,
 //                       LF_HipF,LR_HipF,RF_HipF,RR_HipF,
 //                       LF_Knee,LR_Knee,RF_Knee,RR_Knee]
-// CAN bus:  candle0=LF, candle1=LR, candle2=RF, candle3=RR
+// CAN bus:  can0=LF, can1=LR, can2=RF, can3=RR
 // Motor ID: HipA=1/5/9/13, HipF=2/6/10/14, Knee=3/7/11/15
 
 // MPC index -> (CAN bus index, Motor ID, joint name, joint_offset index)
 struct JointInfo {
-    int can_bus;      // 0-3 -> candle0-candle3
+    int can_bus;      // 0-3 -> can0-can3
     int motor_id;
     int offset_idx;   // index in cfg.joint_offsets[12]
     const char* name;
@@ -58,19 +58,19 @@ struct JointInfo {
 static const int MPC_TO_MOTOR_IDX[12] = {0,4,8, 1,5,9, 2,6,10, 3,7,11};
 
 static const JointInfo JOINTS[12] = {
-    // MPC 0-2: LF leg -> candle0
+    // MPC 0-2: LF leg -> can0
     {0,  1, 0,  "LF_HipA", false},   // MPC 0
     {0,  2, 4,  "LF_HipF", false},   // MPC 1
     {0,  3, 8,  "LF_Knee", true },   // MPC 2
-    // MPC 3-5: LR leg -> candle1
+    // MPC 3-5: LR leg -> can1
     {1,  5, 1,  "LR_HipA", false},   // MPC 3
     {1,  6, 5,  "LR_HipF", false},   // MPC 4
     {1,  7, 9,  "LR_Knee", true },   // MPC 5
-    // MPC 6-8: RF leg -> candle2
+    // MPC 6-8: RF leg -> can2
     {2,  9, 2,  "RF_HipA", false},   // MPC 6
     {2, 10, 6,  "RF_HipF", false},   // MPC 7
     {2, 11, 10, "RF_Knee", true },   // MPC 8
-    // MPC 9-11: RR leg -> candle3
+    // MPC 9-11: RR leg -> can3
     {3, 13, 3,  "RR_HipA", false},   // MPC 9
     {3, 14, 7,  "RR_HipF", false},   // MPC 10
     {3, 15, 11, "RR_Knee", true },   // MPC 11
@@ -92,9 +92,8 @@ static int read_all_positions(const RobotConfig& cfg) {
 
     auto rs = std::make_shared<RobstrideController>();
     std::shared_ptr<CANInterface> cans[4];
-    const char* can_names[4] = {"candle0", "candle1", "candle2", "candle3"};
     for (int i = 0; i < 4; ++i) {
-        cans[i] = std::make_shared<CANInterface>(can_names[i]);
+        cans[i] = std::make_shared<CANInterface>(cfg.can_interfaces[i].c_str());
         rs->BindCAN(cans[i]);
     }
 
@@ -106,10 +105,8 @@ static int read_all_positions(const RobotConfig& cfg) {
 
     // 绑定并使能全部电机（零力矩模式，不会动）
     const int MOTOR_IDS[12] = {1,5,9,13, 2,6,10,14, 3,7,11,15};
-    const char CAN_IDS[4] = {'0','1','2','3'};
-
     for (int j = 0; j < 4; ++j) {
-        std::string can_if = std::string("candle") + CAN_IDS[j];
+        const std::string& can_if = cfg.can_interfaces[j];
         for (int i = 0; i < 3; ++i) {
             int global_idx = j + i * 4;
             auto minfo = std::make_unique<RobstrideController::MotorInfo>();
@@ -210,7 +207,7 @@ static int read_all_positions(const RobotConfig& cfg) {
 static int test_single(int mpc_idx, const RobotConfig& cfg) {
     const JointInfo& ji = JOINTS[mpc_idx];
 
-    std::string can_if = std::string("candle") + std::to_string(ji.can_bus);
+    const std::string& can_if = cfg.can_interfaces[ji.can_bus];
     std::cout << "\n===== 单关节测试 =====\n"
               << "  MPC index:  " << mpc_idx << "\n"
               << "  关节名称:   " << ji.name << "\n"
