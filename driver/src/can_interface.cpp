@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstring>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
@@ -36,6 +37,11 @@ CANInterface::CANInterface(const char* can_if) : running(false), can_socket(-1),
         can_socket = -1;
         return;
     }
+
+    // Non-blocking writes: if the TX queue is full (e.g. bus-off with no ACK),
+    // write() returns EAGAIN instead of blocking indefinitely.
+    int flags = fcntl(can_socket, F_GETFL, 0);
+    fcntl(can_socket, F_SETFL, flags | O_NONBLOCK);
 
     running = true;
     can_thread = std::thread([this]() {
@@ -111,7 +117,9 @@ int CANInterface::SendMessage(const struct can_frame* frame) {
     
     int nbytes = write(can_socket, frame, sizeof(struct can_frame));
     if (nbytes != sizeof(struct can_frame)) {
-        perror("Write");
+        // EAGAIN means TX queue full (bus-off / no ACK) — skip this frame silently.
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            perror("CAN write");
         return -1;
     }
     return 0;
